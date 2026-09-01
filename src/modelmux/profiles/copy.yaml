@@ -1,0 +1,10 @@
+name: copy
+task: copy
+adapter: copy
+input:
+  extension: .txt
+output:
+  extension: .txt
+defaults: {}
+capabilities:
+  streaming: false

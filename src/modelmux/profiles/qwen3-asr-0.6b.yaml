@@ -1,0 +1,30 @@
+name: qwen3-asr-0.6b
+task: asr
+adapter: command
+description: Qwen3-ASR 0.6B 4-bit MLX.
+model: mlx-community/Qwen3-ASR-0.6B-4bit
+input:
+  kind: audio
+  extension: .wav
+output:
+  kind: text
+  extension: .txt
+  media_type: text/plain
+defaults:
+  runtime_python: python3
+  model_path: ~/Library/Caches/modelmux/models/qwen3-asr-0.6b
+capabilities:
+  streaming: false
+  timestamps: false
+  languages:
+    - auto
+command:
+  argv:
+    - "{runtime_python}"
+    - "{package_root}/workers/qwen3_asr.py"
+    - --model
+    - "{model_path}"
+    - --input
+    - "{input_path}"
+    - --output
+    - "{output_path}"
