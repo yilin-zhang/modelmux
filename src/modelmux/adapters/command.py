@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +78,10 @@ class CommandAdapter(Adapter):
                 text=True,
                 env=environment,
             )
-            stdout, stderr = process.communicate()
+            if command.get("events") == "jsonl":
+                stdout, stderr = self._stream_events(process, context)
+            else:
+                stdout, stderr = process.communicate()
         except KeyboardInterrupt:
             process.terminate()
             process.wait()
@@ -93,3 +98,35 @@ class CommandAdapter(Adapter):
             output_path=context.output_path,
             metadata={"adapter": "command", "command": argv[0]},
         )
+
+    @staticmethod
+    def _stream_events(
+        process: subprocess.Popen[str], context: RunContext
+    ) -> tuple[str, str]:
+        stdout_parts: list[str] = []
+        diagnostics: list[str] = []
+
+        def read_stdout() -> None:
+            assert process.stdout is not None
+            stdout_parts.append(process.stdout.read())
+
+        reader = threading.Thread(target=read_stdout, daemon=True)
+        reader.start()
+        assert process.stderr is not None
+        for line in process.stderr:
+            value = line.strip()
+            if not value:
+                continue
+            try:
+                payload = json.loads(value)
+            except json.JSONDecodeError:
+                diagnostics.append(value)
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("type"), str):
+                kind = str(payload.pop("type"))
+                context.emit(Event(kind, payload))
+            else:
+                diagnostics.append(value)
+        process.wait()
+        reader.join()
+        return "".join(stdout_parts), "\n".join(diagnostics)

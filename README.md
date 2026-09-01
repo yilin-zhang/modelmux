@@ -8,9 +8,14 @@ the model-specific code.
 
 ```sh
 uv run modelmux profiles
-printf '这是一个测试。' | uv run modelmux tts --profile macos-say -o /tmp/test.aiff
-afplay /tmp/test.aiff
+printf '这是一个测试。' | uv run modelmux tts -o /tmp/test.wav
+afplay /tmp/test.wav
 ```
+
+The default TTS profile is Qwen3-TTS Base 0.6B 8-bit. It applies the same reference
+audio and transcript to every coarse paragraph group, then joins groups with a short
+crossfade. Repository defaults use ModelMux's standard cache paths; machine-specific
+model, runtime, and voice-prompt paths belong in the user configuration.
 
 The built-in `qwen3-asr-0.6b` profile expects its model in ModelMux's standard
 cache location and forces offline mode:
@@ -101,9 +106,14 @@ developing:
 
 Commands:
 
-- `M-x modelmux-tts-region`
-- `M-x modelmux-tts-buffer`
+- `M-x modelmux-speak` reads the active region, or the entire buffer when no region is active
+- `M-x modelmux-tasks` opens the live task and artifact table
 - `M-x modelmux-stop`
+
+The task table uses `RET` to open or play an artifact inside Emacs, `o` to open it
+with the macOS default app, `O` to open its directory in Finder, `k` to cancel a
+queued or running task, and `g` to refresh. Heavy model jobs are serialized locally
+so queued tasks cannot load several copies of the same model into memory.
 
 ## Local files
 

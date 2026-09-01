@@ -1,0 +1,64 @@
+name: qwen3-tts-0.6b-base-8bit
+task: tts
+adapter: command
+description: Qwen3-TTS Base 0.6B 8-bit with a fixed ICL voice prompt.
+model: mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit
+input:
+  kind: text
+  extension: .txt
+output:
+  kind: audio
+  extension: .wav
+  media_type: audio/wav
+defaults:
+  runtime_python: python3
+  model_path: ~/Library/Caches/modelmux/models/qwen3-tts-0.6b-base-8bit
+  reference_audio: ~/.config/modelmux/voices/narrator.flac
+  reference_text: >-
+    But continued Raoul, not interrupted by this movement of his friend, heaven be
+    praised, the French, who are pronounced to be thoughtless and indiscreet,
+    reckless even, are capable of bringing a calm and sound judgment to bear on
+    matters of such high importance.
+  language: chinese
+  seed: 20260830
+  temperature: 0.7
+  top_k: 30
+  top_p: 0.9
+  repetition_penalty: 1.5
+  max_chars: 700
+  crossfade_ms: 80
+capabilities:
+  streaming: false
+  voice_prompt: true
+  long_text: true
+command:
+  events: jsonl
+  argv:
+    - "{runtime_python}"
+    - "{package_root}/workers/qwen3_tts.py"
+    - --model
+    - "{model_path}"
+    - --reference-audio
+    - "{reference_audio}"
+    - --reference-text
+    - "{reference_text}"
+    - --input
+    - "{input_path}"
+    - --output
+    - "{output_path}"
+    - --language
+    - "{language}"
+    - --seed
+    - "{seed}"
+    - --temperature
+    - "{temperature}"
+    - --top-k
+    - "{top_k}"
+    - --top-p
+    - "{top_p}"
+    - --repetition-penalty
+    - "{repetition_penalty}"
+    - --max-chars
+    - "{max_chars}"
+    - --crossfade-ms
+    - "{crossfade_ms}"

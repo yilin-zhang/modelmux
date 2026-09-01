@@ -4,7 +4,7 @@ from pathlib import Path
 
 from modelmux.cli import execute, parser
 from modelmux.config import Profile
-from modelmux.events import null_sink
+from modelmux.events import Event, null_sink
 from modelmux.runtime import run_profile
 
 
@@ -26,7 +26,7 @@ def test_profiles_lists_builtins(capsys) -> None:
     assert execute(arguments) == 0
     output = capsys.readouterr().out
     assert "copy\tcopy\tcopy" in output
-    assert "macos-say\ttts\tcommand" in output
+    assert "qwen3-tts-0.6b-base-8bit\ttts\tcommand" in output
 
 
 def test_managed_outputs_are_private(tmp_path: Path, monkeypatch) -> None:
@@ -84,3 +84,39 @@ def test_command_adapter_does_not_inherit_secrets(tmp_path: Path, monkeypatch) -
         emit=null_sink,
     )
     assert result.output_path.read_text(encoding="utf-8") == "missing"
+
+
+def test_command_adapter_streams_json_events(tmp_path: Path, monkeypatch) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import json, pathlib, sys\n"
+        "print(json.dumps({'type': 'progress', 'progress': 42}), file=sys.stderr)\n"
+        "pathlib.Path(sys.argv[1]).write_text('done')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MODELMUX_CACHE_HOME", str(tmp_path / "cache"))
+    profile = Profile(
+        "event-test",
+        "test",
+        {
+            "task": "test",
+            "adapter": "command",
+            "defaults": {},
+            "input": {"extension": ".txt"},
+            "output": {"extension": ".txt"},
+            "command": {
+                "events": "jsonl",
+                "argv": [sys.executable, str(worker), "{output_path}"],
+            },
+        },
+    )
+    events: list[Event] = []
+    run_profile(
+        task="test",
+        profile=profile,
+        input_bytes=b"",
+        output_path=None,
+        parameters={},
+        emit=events.append,
+    )
+    assert any(event.type == "progress" and event.data["progress"] == 42 for event in events)
