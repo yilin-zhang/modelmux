@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-def emit(kind: str, **data: object) -> None:
+def emit_stderr(kind: str, **data: object) -> None:
     print(json.dumps({"type": kind, **data}, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
@@ -16,8 +16,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--model", required=True)
     result.add_argument("--reference-audio", required=True)
     result.add_argument("--reference-text", required=True)
-    result.add_argument("--input", required=True)
-    result.add_argument("--output", required=True)
+    result.add_argument("--input")
+    result.add_argument("--output")
+    result.add_argument("--serve", action="store_true")
     result.add_argument("--language", default="chinese")
     result.add_argument("--seed", type=int, default=20260830)
     result.add_argument("--temperature", type=float, default=0.7)
@@ -80,8 +81,7 @@ def crossfade_join(parts: list[object], sample_rate: int, fade_ms: int):
     return joined * (0.98 / peak) if peak > 0.98 else joined
 
 
-def main() -> None:
-    arguments = parser().parse_args()
+def synthesize(arguments, *, model=None, report=emit_stderr) -> None:
     model_path = Path(arguments.model).expanduser().resolve()
     reference_audio = Path(arguments.reference_audio).expanduser().resolve()
     input_path = Path(arguments.input).expanduser().resolve()
@@ -105,13 +105,14 @@ def main() -> None:
     import soundfile as sf
     from mlx_audio.tts.utils import load_model
 
-    emit("progress", progress=2, phase="load", message="Loading Qwen3-TTS…")
-    model = load_model(str(model_path))
+    if model is None:
+        report("progress", progress=2, phase="load", message="Loading Qwen3-TTS…")
+        model = load_model(str(model_path))
     mx.random.seed(arguments.seed)
     rendered: list[object] = []
     sample_rate: int | None = None
     for index, chunk in enumerate(chunks, start=1):
-        emit(
+        report(
             "progress",
             progress=3 + round((index - 1) / len(chunks) * 94),
             phase="synthesize",
@@ -155,7 +156,46 @@ def main() -> None:
         sample_rate,
         subtype="PCM_16",
     )
-    emit("progress", progress=100, phase="write", message="Audio ready")
+    report("progress", progress=100, phase="write", message="Audio ready")
+
+
+def serve(arguments) -> None:
+    from mlx_audio.tts.utils import load_model
+
+    model_path = Path(arguments.model).expanduser().resolve()
+    if not model_path.is_dir():
+        raise SystemExit(f"Model is missing: {model_path}")
+    model = load_model(str(model_path))
+
+    def protocol(kind: str, **data: object) -> None:
+        print(json.dumps({"type": kind, **data}, ensure_ascii=False), flush=True)
+
+    protocol("ready")
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            if request.get("type") == "shutdown":
+                return
+            if request.get("type") != "run":
+                raise ValueError("unknown request type")
+            values = vars(arguments).copy()
+            values.update(request.get("parameters", {}))
+            values["input"] = request["input_path"]
+            values["output"] = request["output_path"]
+            synthesize(argparse.Namespace(**values), model=model, report=protocol)
+            protocol("result")
+        except Exception as error:
+            protocol("error", message=str(error))
+
+
+def main() -> None:
+    arguments = parser().parse_args()
+    if arguments.serve:
+        serve(arguments)
+        return
+    if not arguments.input or not arguments.output:
+        raise SystemExit("--input and --output are required")
+    synthesize(arguments)
 
 
 if __name__ == "__main__":

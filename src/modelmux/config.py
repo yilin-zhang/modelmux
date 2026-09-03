@@ -87,6 +87,44 @@ class Profile:
         return value if value.startswith(".") else f".{value}"
 
 
+@dataclass(frozen=True)
+class ServerSettings:
+    host: str = "127.0.0.1"
+    port: int = 8765
+    concurrency: int = 1
+    model_loading: str = "lazy"
+    preload: tuple[str, ...] = ()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+
+def server_settings(root: Path | None = None) -> ServerSettings:
+    raw = ProfileStore(root).user_config().get("server", {})
+    if not isinstance(raw, dict):
+        raise ModelMuxError("config server must be a mapping")
+    host = str(raw.get("host", "127.0.0.1"))
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ModelMuxError("ModelMux server may only listen on localhost")
+    try:
+        port = int(raw.get("port", 8765))
+        concurrency = int(raw.get("concurrency", 1))
+    except (TypeError, ValueError) as error:
+        raise ModelMuxError("server port and concurrency must be integers") from error
+    if not 1 <= port <= 65535:
+        raise ModelMuxError("server port must be between 1 and 65535")
+    if concurrency < 1:
+        raise ModelMuxError("server concurrency must be at least 1")
+    loading = str(raw.get("model_loading", "lazy"))
+    if loading not in {"ephemeral", "lazy", "preload"}:
+        raise ModelMuxError("server model_loading must be ephemeral, lazy, or preload")
+    preload = raw.get("preload", [])
+    if not isinstance(preload, list) or not all(isinstance(item, str) for item in preload):
+        raise ModelMuxError("server preload must be a list of profile names")
+    return ServerSettings(host, port, concurrency, loading, tuple(preload))
+
+
 class ProfileStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or config_home()

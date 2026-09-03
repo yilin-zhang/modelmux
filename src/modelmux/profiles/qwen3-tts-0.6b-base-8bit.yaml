@@ -33,6 +33,16 @@ capabilities:
   long_text: true
 command:
   events: jsonl
+  worker_argv:
+    - "{runtime_python}"
+    - "{package_root}/workers/qwen3_tts.py"
+    - --serve
+    - --model
+    - "{model_path}"
+    - --reference-audio
+    - "{reference_audio}"
+    - --reference-text
+    - "{reference_text}"
   argv:
     - "{runtime_python}"
     - "{package_root}/workers/qwen3_tts.py"

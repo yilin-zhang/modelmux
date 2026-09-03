@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ class RunContext:
     output_path: Path
     parameters: dict[str, Any]
     emit: EventSink
+    cancelled: threading.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,12 @@ class RunResult:
 class Adapter(ABC):
     def __init__(self, profile: Profile) -> None:
         self.profile = profile
+
+    def load(self) -> None:
+        """Load reusable resources, if this adapter supports residency."""
+
+    def close(self) -> None:
+        """Release reusable resources held by this adapter."""
 
     @abstractmethod
     def run(self, context: RunContext) -> RunResult:

@@ -5,12 +5,11 @@ import json
 import os
 import re
 import shutil
-import signal
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator
+from typing import Any, BinaryIO, Generator
 
 from modelmux.config import cache_home
 from modelmux.errors import ModelMuxError
@@ -45,7 +44,7 @@ class RunStore:
         return self._run_dir(run_id) / "meta.json"
 
     @contextmanager
-    def _metadata_lock(self, run_id: str) -> Iterator[None]:
+    def _metadata_lock(self, run_id: str) -> Generator[None, None, None]:
         path = self._run_dir(run_id) / ".metadata.lock"
         with path.open("a+b") as lock:
             os.fchmod(lock.fileno(), 0o600)
@@ -211,7 +210,7 @@ class RunStore:
             return False
 
     @contextmanager
-    def queue_slot(self) -> Iterator[None]:
+    def queue_slot(self) -> Generator[None, None, None]:
         self._ensure_root()
         with (self.root / ".queue.lock").open("a+b") as lock:
             os.fchmod(lock.fileno(), 0o600)
@@ -244,19 +243,3 @@ class RunStore:
             run_dirs.append(run_dir)
         for run_dir in run_dirs:
             shutil.rmtree(run_dir)
-
-    def cancel(self, run_id: str) -> dict[str, Any]:
-        record = self.get(run_id)
-        if record.get("status") not in ACTIVE_STATUSES:
-            raise ModelMuxError(f"Run {run_id} is not active")
-        if not self.is_active(run_id):
-            return self.get(run_id)
-        pid = record.get("pid")
-        if not isinstance(pid, int) or pid <= 1:
-            raise ModelMuxError(f"Run {run_id} has no valid process id")
-        record = self.update(run_id, message="Cancelling")
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return self.get(run_id)
-        return record

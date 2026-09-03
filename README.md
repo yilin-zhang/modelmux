@@ -1,16 +1,20 @@
 # ModelMux
 
-ModelMux is a small local interface for running AI models from the command line,
-Emacs, or any other frontend. Profiles declare configuration; Python adapters own
-the model-specific code.
+ModelMux is a local HTTP gateway for AI models. Emacs, the CLI, and other clients use
+one stable API; server-side profiles and adapters select the actual local or remote
+backend.
 
 ## Quick start
 
 ```sh
+uv run modelmux server start
 uv run modelmux profiles
 printf '这是一个测试。' | uv run modelmux tts -o /tmp/test.wav
 afplay /tmp/test.wav
+uv run modelmux server stop
 ```
+
+The CLI does not start the server implicitly. Use `modelmux server status` to check it.
 
 The default TTS profile is Qwen3-TTS Base 0.6B 8-bit. It applies the same reference
 audio and transcript to every coarse paragraph group, then joins groups with a short
@@ -42,9 +46,9 @@ Run the dependency-free integration profile:
 printf 'hello' | uv run modelmux run copy --profile copy
 ```
 
-Every invocation creates a persistent run record. Managed outputs live beside their
+Every submitted job creates a persistent run record. Managed outputs live beside their
 metadata under `runs/<uuid>/`; input contents and resolved parameters are not recorded.
-Python also serializes runs so concurrent frontends cannot load multiple models at once.
+The server remains responsive while model work runs in its worker pool.
 
 ```sh
 modelmux runs list --json
@@ -97,14 +101,42 @@ profiles:
 
 Resolution order is: profile defaults, user profile override, command-line `--set`.
 
+Server behavior is configured in the same private YAML:
+
+```yaml
+server:
+  host: 127.0.0.1
+  port: 8765
+  concurrency: 1
+  model_loading: lazy  # ephemeral | lazy | preload
+  preload: []
+```
+
+`lazy` keeps a reusable model worker resident and, with the default single worker,
+unloads it when switching profiles. `preload` loads the named profiles at server start.
+`ephemeral` starts a fresh model command for each job.
+
+## HTTP API
+
+- `POST /v1/jobs` submits an asynchronous job
+- `GET /v1/jobs` and `GET /v1/jobs/:id` return persistent state
+- `GET /v1/jobs/:id/events` streams state changes as SSE
+- `GET /v1/jobs/:id/artifact` downloads the result
+- `POST /v1/jobs/cancel` and `POST /v1/jobs/delete` accept an `ids` array
+- `POST /v1/audio/speech` is OpenAI-compatible TTS
+- `POST /v1/audio/transcriptions` is OpenAI-compatible ASR
+- `GET /v1/models` lists configured profiles
+
 ## Adapter contract
 
 Subclass `modelmux.adapters.Adapter` and implement `run(context)`. The context contains
 the task, resolved profile, temporary input path, requested output path, merged
-parameters, and an event callback. Return `RunResult` with the output path and metadata.
+parameters, an event callback, and a cancellation event. Return `RunResult` with the
+output path and metadata. Optional `load()` and `close()` hooks own resident resources.
 
 The built-in `command` adapter is useful when a model already provides a CLI. Its
-`command.argv` is always executed directly, never through a shell.
+`command.argv` is always executed directly, never through a shell. Profiles may also
+provide `command.worker_argv` for a reusable JSON-lines worker; Qwen3 TTS and ASR do so.
 
 ## Emacs
 
@@ -120,6 +152,7 @@ developing:
 
 Commands:
 
+- `M-x modelmux-server-start`, `modelmux-server-status`, and `modelmux-server-stop`
 - `M-x modelmux-speak` generates speech for the active region, or the entire buffer when no region is active
 - `M-x modelmux-tasks` opens the live task and artifact table
 - `M-x modelmux-stop`
@@ -128,18 +161,18 @@ Speech generation does not start playback automatically. The task table uses `RE
 `o` to open an artifact with the system default app, `O` to open its directory,
 `e` to rename, and `k` to cancel. Mark rows with `m`, unmark with `u` or `U`, and
 delete the marked rows (or the current row) with `D`. `g` refreshes immediately;
-visible task buffers also refresh automatically. The UI reads and mutates runs only
-through the ModelMux CLI.
+visible task buffers also refresh automatically. Emacs sends HTTP requests directly;
+the CLI is used only for starting and stopping the detached server.
 
 ## Local files
 
 - Configuration: `~/.config/modelmux/`
 - Run metadata and managed outputs on macOS: `~/Library/Caches/modelmux/runs/<uuid>/`
 - Scratch space on macOS: `~/Library/Caches/modelmux/tmp/`
+- Detached server log and PID on macOS: `~/Library/Caches/modelmux/server.{log,pid}`
 
-ModelMux has no telemetry and performs no network requests itself. Individual model
-adapters and their dependencies may download models; each adapter should document that
-behavior explicitly.
+ModelMux has no telemetry. A configured remote adapter may make network requests;
+individual adapters must document download and network behavior explicitly.
 
 ## Security model
 
@@ -151,4 +184,7 @@ variables to child processes. Secrets must be opted into explicitly by an adapte
 Generated files in ModelMux's managed cache are user-only (`0600`) and its runtime
 directories are `0700`. Files written to an explicit `--output` path keep the caller's
 normal permissions. Run metadata is written atomically and does not contain input
-contents or merged profile parameters. User configuration and model weights are ignored by git.
+contents or merged profile parameters. HTTP responses omit server filesystem paths,
+adapter metadata, and process IDs. The server binds only to localhost and rejects
+foreign browser origins. User
+configuration and model weights are ignored by git.

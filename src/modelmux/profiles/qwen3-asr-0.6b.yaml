@@ -19,6 +19,12 @@ capabilities:
   languages:
     - auto
 command:
+  worker_argv:
+    - "{runtime_python}"
+    - "{package_root}/workers/qwen3_asr.py"
+    - --serve
+    - --model
+    - "{model_path}"
   argv:
     - "{runtime_python}"
     - "{package_root}/workers/qwen3_asr.py"

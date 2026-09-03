@@ -4,12 +4,12 @@ import fcntl
 import signal
 import tempfile
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, BinaryIO, Generator
 
-from modelmux.adapters import RunContext, RunResult, load_adapter
+from modelmux.adapters import Adapter, RunContext, RunResult, load_adapter
 from modelmux.config import Profile, cache_home
 from modelmux.errors import ModelMuxError
 from modelmux.events import Event, EventSink
@@ -17,7 +17,7 @@ from modelmux.runs import RunStore
 
 
 @contextmanager
-def _cancel_on_sigterm() -> Iterator[None]:
+def _cancel_on_sigterm() -> Generator[None, None, None]:
     if threading.current_thread() is not threading.main_thread():
         yield
         return
@@ -33,26 +33,21 @@ def _cancel_on_sigterm() -> Iterator[None]:
         signal.signal(signal.SIGTERM, previous)
 
 
-def run_profile(
+def execute_created_run(
     *,
+    store: RunStore,
+    record: dict[str, Any],
+    active_lock: BinaryIO,
     task: str,
     profile: Profile,
     input_bytes: bytes,
-    output_path: Path | None,
     parameters: dict[str, Any],
     emit: EventSink,
+    cancelled: threading.Event | None = None,
+    serialize: bool = False,
+    adapter: Adapter | None = None,
 ) -> RunResult:
-    if task != profile.task:
-        raise ModelMuxError(
-            f"Profile {profile.name!r} handles {profile.task!r}, not {task!r}"
-        )
-    store = RunStore()
-    record, active_lock = store.create(
-        task=task,
-        profile=profile.name,
-        extension=profile.extension,
-        output_path=output_path,
-    )
+    """Execute a run created by ``RunStore.create`` and finalize its record."""
     run_id = str(record["id"])
     destination = Path(str(record["artifact"]))
     managed_output = bool(record["managed_artifact"])
@@ -69,8 +64,6 @@ def run_profile(
         try:
             emit(event)
         except BrokenPipeError:
-            # The caller may disappear while a local model is still finishing.
-            # Keep the durable run authoritative instead of failing the work.
             pass
 
     try:
@@ -85,7 +78,10 @@ def run_profile(
                 },
             )
         )
-        with _cancel_on_sigterm(), store.queue_slot():
+        queue = store.queue_slot() if serialize else nullcontext()
+        with _cancel_on_sigterm(), queue:
+            if cancelled is not None and cancelled.is_set():
+                raise KeyboardInterrupt
             store.update(
                 run_id,
                 status="running",
@@ -115,17 +111,15 @@ def run_profile(
                     output_path=destination,
                     parameters=parameters,
                     emit=tracked_emit,
+                    cancelled=cancelled,
                 )
-                result = load_adapter(profile).run(context)
+                result = (adapter or load_adapter(profile)).run(context)
+        if cancelled is not None and cancelled.is_set():
+            raise KeyboardInterrupt
         if managed_output:
             result.output_path.parent.chmod(0o700)
             result.output_path.chmod(0o600)
-        store.finish(
-            run_id,
-            "completed",
-            message="Completed",
-            metadata=result.metadata,
-        )
+        store.finish(run_id, "completed", message="Completed", metadata=result.metadata)
         tracked_emit(
             Event(
                 "result",
@@ -148,3 +142,36 @@ def run_profile(
     finally:
         fcntl.flock(active_lock, fcntl.LOCK_UN)
         active_lock.close()
+
+
+def run_profile(
+    *,
+    task: str,
+    profile: Profile,
+    input_bytes: bytes,
+    output_path: Path | None,
+    parameters: dict[str, Any],
+    emit: EventSink,
+) -> RunResult:
+    if task != profile.task:
+        raise ModelMuxError(
+            f"Profile {profile.name!r} handles {profile.task!r}, not {task!r}"
+        )
+    store = RunStore()
+    record, active_lock = store.create(
+        task=task,
+        profile=profile.name,
+        extension=profile.extension,
+        output_path=output_path,
+    )
+    return execute_created_run(
+        store=store,
+        record=record,
+        active_lock=active_lock,
+        task=task,
+        profile=profile,
+        input_bytes=input_bytes,
+        parameters=parameters,
+        emit=emit,
+        serialize=True,
+    )

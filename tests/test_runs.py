@@ -171,6 +171,22 @@ def test_runs_cli_lists_renames_and_deletes(tmp_path: Path, monkeypatch, capsys)
     )
     assert result.run_id is not None
 
+    store = RunStore()
+
+    class Client:
+        def json(self, method, path, payload=None):
+            if path == "/v1/jobs":
+                return store.list()
+            if path == "/v1/jobs/delete":
+                store.delete_many(payload["ids"])
+                return {"deleted": payload["ids"]}
+            run_id = path.split("/")[3]
+            if method == "PATCH":
+                return store.rename(run_id, payload["name"])
+            return store.get(run_id)
+
+    monkeypatch.setattr("modelmux.cli.ModelMuxClient", lambda _settings: Client())
+
     assert execute(parser().parse_args(["runs", "list", "--json"])) == 0
     listed = json.loads(capsys.readouterr().out)
     assert listed[0]["id"] == result.run_id
@@ -191,4 +207,4 @@ def test_runs_cli_lists_renames_and_deletes(tmp_path: Path, monkeypatch, capsys)
         == 0
     )
     assert json.loads(capsys.readouterr().out)["deleted"] == [result.run_id]
-    assert RunStore().list() == []
+    assert store.list() == []
