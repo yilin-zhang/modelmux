@@ -7,6 +7,7 @@ import mimetypes
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from email import policy
@@ -16,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
 from urllib.error import URLError
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 
 from modelmux.config import ProfileStore, ServerSettings, cache_home
@@ -69,6 +71,17 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
+    def _send_file(self, path: Path, content_type: str) -> None:
+        """Send PATH without loading the complete artifact into memory."""
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                self.wfile.write(chunk)
+
     def _origin_allowed(self) -> bool:
         origin = self.headers.get("Origin")
         if origin and origin.rstrip("/") != self.app.settings.base_url:
@@ -83,13 +96,41 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
         self._json(status, {"error": {"message": message}})
 
     def _body(self) -> bytes:
+        return self.rfile.read(self._content_length())
+
+    def _content_length(self) -> int:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as error:
             raise ModelMuxError("Invalid Content-Length") from error
         if length < 0 or length > MAX_REQUEST_BYTES:
             raise ModelMuxError("Request body is too large")
-        return self.rfile.read(length)
+        return length
+
+    def _body_to_temporary_file(self) -> Path:
+        """Stream the request body to a private temporary file."""
+        remaining = self._content_length()
+        temporary_root = cache_home() / "tmp"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        temporary_root.chmod(0o700)
+        path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="upload-", dir=temporary_root, delete=False
+            ) as output:
+                path = Path(output.name)
+                os.fchmod(output.fileno(), 0o600)
+                while remaining:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ModelMuxError("Upload ended before Content-Length")
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            return path
+        except BaseException:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            raise
 
     def _json_body(self) -> dict[str, Any]:
         try:
@@ -149,7 +190,7 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
                     self._error(HTTPStatus.CONFLICT, "Artifact is not ready")
                     return
                 media_type = mimetypes.guess_type(artifact.name)[0] or "application/octet-stream"
-                self._send(HTTPStatus.OK, artifact.read_bytes(), media_type)
+                self._send_file(artifact, media_type)
             elif (run_id := self._job_id("/events")) is not None:
                 self._events(run_id)
             elif (run_id := self._job_id()) is not None:
@@ -191,6 +232,8 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
                     parameters=parameters,
                 )
                 self._json(HTTPStatus.ACCEPTED, _public_record(record))
+            elif urlsplit(self.path).path == "/v1/jobs/upload":
+                self._upload_job()
             elif self.path == "/v1/jobs/cancel":
                 ids = self._json_body().get("ids")
                 if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
@@ -272,7 +315,27 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
             raise ModelMuxError(str(completed.get("error") or completed["status"]))
         artifact = Path(str(completed["artifact"]))
         media_type = mimetypes.guess_type(artifact.name)[0] or "application/octet-stream"
-        self._send(HTTPStatus.OK, artifact.read_bytes(), media_type)
+        self._send_file(artifact, media_type)
+
+    def _upload_job(self) -> None:
+        """Stream a binary input into an asynchronous job."""
+        if self.headers.get_content_type() != "application/octet-stream":
+            raise ModelMuxError("Expected application/octet-stream")
+        query = parse_qs(urlsplit(self.path).query)
+        task = query.get("task", [""])[0]
+        model = query.get("model", [None])[0]
+        if not task:
+            raise ModelMuxError("task is required")
+        source = self._body_to_temporary_file()
+        try:
+            record = self.app.manager.submit_file(
+                task=task,
+                profile_name=model,
+                source=source,
+            )
+        finally:
+            source.unlink(missing_ok=True)
+        self._json(HTTPStatus.ACCEPTED, _public_record(record))
 
     def _transcription(self) -> None:
         parts = self._parts()

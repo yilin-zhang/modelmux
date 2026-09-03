@@ -86,6 +86,11 @@ class Profile:
         value = str(self.data.get("output", {}).get("extension", ".out"))
         return value if value.startswith(".") else f".{value}"
 
+    @property
+    def input_extension(self) -> str:
+        value = str(self.data.get("input", {}).get("extension", ".input"))
+        return value if value.startswith(".") else f".{value}"
+
 
 @dataclass(frozen=True)
 class ServerSettings:

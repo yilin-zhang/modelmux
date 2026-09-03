@@ -43,6 +43,18 @@ class RunStore:
     def _metadata_path(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "meta.json"
 
+    def input_path(self, run_id: str, extension: str) -> Path:
+        """Return the private, temporary input path for a run."""
+        if not re.fullmatch(r"\.[A-Za-z0-9._-]+", extension):
+            raise ModelMuxError(f"Invalid input extension: {extension}")
+        return self._run_dir(run_id) / f".input{extension}"
+
+    def remove_input(self, run_id: str) -> None:
+        """Remove a run's staged input, if one exists."""
+        for path in self._run_dir(run_id).glob(".input.*"):
+            if path.is_file() and not path.is_symlink():
+                path.unlink(missing_ok=True)
+
     @contextmanager
     def _metadata_lock(self, run_id: str) -> Generator[None, None, None]:
         path = self._run_dir(run_id) / ".metadata.lock"
@@ -128,6 +140,7 @@ class RunStore:
     def get(self, run_id: str, *, reconcile: bool = True) -> dict[str, Any]:
         record = self._read_unlocked(run_id)
         if reconcile and record.get("status") in ACTIVE_STATUSES and not self.is_active(run_id):
+            self.remove_input(run_id)
             record = self.update(
                 run_id,
                 status="interrupted",

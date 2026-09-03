@@ -30,6 +30,10 @@
   "Base URL of the ModelMux gateway, without a trailing slash."
   :type 'string)
 
+(defcustom modelmux-upload-program "curl"
+  "Program used to stream file inputs to the ModelMux gateway."
+  :type 'string)
+
 (defcustom modelmux-tts-profile "qwen3-tts-0.6b-base-8bit"
   "Profile used by `modelmux-speak'."
   :type 'string)
@@ -73,11 +77,16 @@
   "Face for the mark indicator."
   :group 'modelmux)
 
-(defvar modelmux--tasks nil)
-(defconst modelmux--tasks-buffer "*ModelMux Tasks*")
-(defvar-local modelmux--marked nil)
-(defvar-local modelmux--refresh-timer nil)
-(defvar-local modelmux--refresh-request nil)
+(defvar modelmux--tasks nil
+  "Most recently fetched ModelMux task records.")
+(defconst modelmux--tasks-buffer "*ModelMux Tasks*"
+  "Name of the ModelMux task-list buffer.")
+(defvar-local modelmux--marked nil
+  "Hash table of marked task IDs in the current task-list buffer.")
+(defvar-local modelmux--refresh-timer nil
+  "Refresh timer for the current task-list buffer.")
+(defvar-local modelmux--refresh-request nil
+  "Active HTTP refresh buffer for the current task-list buffer.")
 
 (defun modelmux--buffer-text ()
   "Return the active region, or the entire current buffer."
@@ -92,29 +101,24 @@
   (let ((text (string-trim (modelmux--buffer-text))))
     (when (string-empty-p text)
       (user-error "There is no text to read"))
-    (modelmux--start-run "tts" text modelmux-tts-profile)))
-
-(defun modelmux--file-base64 (file)
-  "Return FILE contents encoded as single-line base64."
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (insert-file-contents-literally file)
-    (base64-encode-string (buffer-string) t)))
+    (modelmux--submit-text-run "tts" modelmux-tts-profile text)))
 
 ;;;###autoload
 (defun modelmux-transcribe (audio-file)
   "Transcribe AUDIO-FILE using `modelmux-asr-profile'."
   (interactive
-   (list (read-file-name "Audio file: " nil nil t nil #'file-regular-p)))
+   (list (read-file-name "Audio file: " nil nil t)))
   (unless (file-regular-p audio-file)
-    (user-error "Audio file does not exist: %s" audio-file))
-  (modelmux--start-run "asr" (modelmux--file-base64 audio-file)
-                       modelmux-asr-profile t))
+    (user-error "Not a regular audio file: %s" audio-file))
+  (modelmux--submit-file-run "asr" modelmux-asr-profile
+                             (expand-file-name audio-file)))
 
 (defun modelmux--url (path)
+  "Resolve API PATH against `modelmux-base-url'."
   (concat (string-remove-suffix "/" modelmux-base-url) path))
 
 (defun modelmux--http-body-start ()
+  "Move point to the start of the current HTTP response body."
   (goto-char (point-min))
   (or (and (boundp 'url-http-end-of-headers) url-http-end-of-headers)
       (progn
@@ -123,6 +127,7 @@
       (point-min)))
 
 (defun modelmux--http-json-from-current-buffer ()
+  "Parse a ModelMux JSON response from the current URL buffer."
   (let ((status (or (and (boundp 'url-http-response-status)
                          url-http-response-status)
                     0)))
@@ -138,6 +143,7 @@
       payload)))
 
 (defun modelmux--http-json-sync (method path &optional payload)
+  "Send a synchronous JSON request using METHOD to PATH with PAYLOAD."
   (let* ((url-request-method method)
          (url-request-extra-headers '(("Content-Type" . "application/json")))
          (url-request-data (and payload (encode-coding-string
@@ -154,6 +160,7 @@
       (kill-buffer buffer))))
 
 (defun modelmux--http-json-async (method path payload callback)
+  "Send JSON PAYLOAD using METHOD to PATH, then call CALLBACK."
   (let ((url-request-method method)
         (url-request-extra-headers '(("Content-Type" . "application/json")))
         (url-request-data (and payload (encode-coding-string
@@ -172,6 +179,7 @@
      nil t t)))
 
 (defun modelmux--server-command (action)
+  "Run the configured ModelMux server ACTION and return its output."
   (unless modelmux-command
     (user-error "`modelmux-command' is empty"))
   (with-temp-buffer
@@ -201,23 +209,69 @@
   (message "%s" (modelmux--server-command "status")))
 
 (defun modelmux--schedule-visible-refresh ()
+  "Refresh the task buffer when it is visible."
   (when-let* ((buffer (get-buffer modelmux--tasks-buffer)))
     (when (get-buffer-window buffer t)
       (with-current-buffer buffer
         (when (derived-mode-p 'modelmux-tasks-mode)
           (modelmux-tasks-refresh))))))
 
-(defun modelmux--start-run (task input profile &optional base64-encoded)
-  "Submit TASK with INPUT and PROFILE directly to the ModelMux HTTP API.
-When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
+(defun modelmux--submit-text-run (task profile text)
+  "Submit TEXT to PROFILE as an asynchronous TASK."
   (modelmux--http-json-async
    "POST" "/v1/jobs"
-   `((task . ,task) (model . ,profile)
-     (,(if base64-encoded 'input_base64 'input) . ,input)
+   `((task . ,task) (model . ,profile) (input . ,text)
      (parameters . ,(make-hash-table :test 'equal)))
    (lambda (job)
      (modelmux--schedule-visible-refresh)
      (message "ModelMux %s job %s queued" (upcase task) (alist-get 'id job)))))
+
+(defun modelmux--upload-url (task profile)
+  "Return the binary upload URL for TASK and PROFILE."
+  (format "%s/v1/jobs/upload?task=%s&model=%s"
+          (string-remove-suffix "/" modelmux-base-url)
+          (url-hexify-string task)
+          (url-hexify-string profile)))
+
+(defun modelmux--upload-sentinel (process _event)
+  "Handle completion of a ModelMux file upload PROCESS."
+  (when (memq (process-status process) '(exit signal))
+    (let ((buffer (process-buffer process))
+          (task (process-get process 'modelmux-task)))
+      (unwind-protect
+          (if (zerop (process-exit-status process))
+              (with-current-buffer buffer
+                (goto-char (point-min))
+                (let ((job (json-parse-buffer :object-type 'alist)))
+                  (modelmux--schedule-visible-refresh)
+                  (message "ModelMux %s job %s queued"
+                           (upcase task) (alist-get 'id job))))
+            (message "ModelMux upload failed: %s"
+                     (string-trim
+                      (with-current-buffer buffer (buffer-string)))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(defun modelmux--submit-file-run (task profile file)
+  "Stream FILE to PROFILE as an asynchronous TASK."
+  (let* ((program (or (executable-find modelmux-upload-program)
+                      (user-error "Cannot find %s" modelmux-upload-program)))
+         (buffer (generate-new-buffer " *modelmux-upload*"))
+         (process
+          (make-process
+           :name "modelmux-upload"
+           :buffer buffer
+           :command
+           (list program "--silent" "--show-error" "--fail-with-body"
+                 "--request" "POST"
+                 "--header" "Content-Type: application/octet-stream"
+                 "--upload-file" file
+                 (modelmux--upload-url task profile))
+           :coding 'utf-8-unix
+           :noquery t
+           :sentinel #'modelmux--upload-sentinel)))
+    (process-put process 'modelmux-task task)
+    (message "Uploading %s to ModelMux…" (file-name-nondirectory file))))
 
 ;;;###autoload
 (defun modelmux-tasks ()
@@ -229,13 +283,16 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
   (modelmux-tasks-refresh))
 
 (defun modelmux--task-by-id (id)
+  "Return the cached task whose ID is ID, or nil."
   (seq-find (lambda (task) (equal (alist-get 'id task) id)) modelmux--tasks))
 
 (defun modelmux--task-at-point ()
+  "Return the cached task displayed at point, or nil."
   (when-let* ((id (tabulated-list-get-id)))
     (modelmux--task-by-id id)))
 
 (defun modelmux--goto-task-id (id)
+  "Move point to task ID and return non-nil when found."
   (goto-char (point-min))
   (while (and (not (eobp))
               (not (equal (tabulated-list-get-id) id)))
@@ -243,6 +300,7 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
   (equal (tabulated-list-get-id) id))
 
 (defun modelmux--progress-cell (progress)
+  "Render numeric PROGRESS as a compact progress bar."
   (let* ((value (max 0 (min 100 (or progress 0))))
          (width 12)
          (filled (round (* width (/ value 100.0)))))
@@ -252,6 +310,7 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
             value)))
 
 (defun modelmux--status-cell (status)
+  "Render task STATUS with its corresponding face."
   (pcase status
     ("queued" (propertize "○ Queued" 'face 'modelmux-status-muted-face))
     ("running" (propertize "● Running" 'face 'modelmux-status-running-face))
@@ -262,10 +321,12 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
     (_ (or status "Unknown"))))
 
 (defun modelmux--parse-time (value)
+  "Parse timestamp VALUE, returning nil when it is absent or invalid."
   (when (and value (not (string-empty-p value)))
     (ignore-errors (date-to-time value))))
 
 (defun modelmux--duration-cell (task)
+  "Return a compact elapsed-time string for TASK."
   (let* ((start (modelmux--parse-time
                  (or (alist-get 'started_at task) (alist-get 'created_at task))))
          (end (modelmux--parse-time (alist-get 'finished_at task)))
@@ -279,6 +340,7 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
      (t (format "%ds" seconds)))))
 
 (defun modelmux--task-entries ()
+  "Build `tabulated-list-entries' from cached ModelMux tasks."
   (mapcar
    (lambda (task)
      (list
@@ -293,6 +355,7 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
    modelmux--tasks))
 
 (defun modelmux--apply-marks ()
+  "Redraw overlays for marked tasks in the current buffer."
   (remove-overlays (point-min) (point-max) 'modelmux-mark t)
   (save-excursion
     (goto-char (point-min))
@@ -303,6 +366,7 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
       (forward-line 1))))
 
 (defun modelmux--add-mark-overlay ()
+  "Add a mark overlay to the task row at point."
   (let ((beginning (line-beginning-position))
         (end (line-end-position)))
     (remove-overlays beginning end 'modelmux-mark t)
@@ -315,6 +379,7 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
                    (propertize "*" 'face 'modelmux-mark-indicator-face)))))
 
 (defun modelmux--print-preserving-position ()
+  "Redraw the task table while preserving point and window positions."
   (let ((id (tabulated-list-get-id))
         (column (current-column))
         (point-before (point))
@@ -332,6 +397,7 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
         (set-window-start (car entry) (cdr entry) t)))))
 
 (defun modelmux--prune-marks ()
+  "Discard marks for tasks absent from the latest response."
   (let (stale)
     (maphash (lambda (id _value)
                (unless (modelmux--task-by-id id) (push id stale)))
@@ -355,15 +421,18 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
                    (modelmux--print-preserving-position)))))))))
 
 (defun modelmux--timer-refresh (buffer)
+  "Refresh task-list BUFFER when it remains visible."
   (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
     (with-current-buffer buffer
       (when (derived-mode-p 'modelmux-tasks-mode)
         (modelmux-tasks-refresh)))))
 
 (defun modelmux--task-id-at-point ()
+  "Return the task ID at point or signal a user error."
   (or (tabulated-list-get-id) (user-error "No task at point")))
 
 (defun modelmux--mark-region (beginning end)
+  "Mark task rows between BEGINNING and END."
   (let ((finish (if (and (> end beginning)
                          (save-excursion (goto-char end) (bolp)))
                     (1- end)
@@ -406,14 +475,17 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
   (message "Cleared all marks"))
 
 (defun modelmux--marked-task-ids ()
+  "Return task IDs marked in the current task-list buffer."
   (let (ids)
     (maphash (lambda (id _value) (push id ids)) modelmux--marked)
     (nreverse ids)))
 
 (defun modelmux--selected-task-ids ()
+  "Return marked task IDs, or the task ID at point when none are marked."
   (or (modelmux--marked-task-ids) (list (modelmux--task-id-at-point))))
 
 (defun modelmux--download-artifact (callback)
+  "Download the artifact at point and invoke CALLBACK with its path."
   (let* ((task (or (modelmux--task-at-point) (user-error "No task at point")))
          (url (alist-get 'artifact_url task))
          (directory (expand-file-name
@@ -510,6 +582,7 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
       (message "No ModelMux task is active"))))
 
 (defun modelmux--stop-refresh-timer ()
+  "Stop refresh activity associated with the current task-list buffer."
   (when (timerp modelmux--refresh-timer)
     (cancel-timer modelmux--refresh-timer))
   (setq modelmux--refresh-timer nil)
@@ -517,7 +590,8 @@ When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
     (kill-buffer modelmux--refresh-request))
   (setq modelmux--refresh-request nil))
 
-(defvar modelmux-tasks-mode-map (make-sparse-keymap))
+(defvar modelmux-tasks-mode-map (make-sparse-keymap)
+  "Keymap for `modelmux-tasks-mode'.")
 (set-keymap-parent modelmux-tasks-mode-map tabulated-list-mode-map)
 (define-key modelmux-tasks-mode-map (kbd "RET") #'modelmux-task-open-externally)
 (define-key modelmux-tasks-mode-map (kbd "o") #'modelmux-task-open-externally)

@@ -132,6 +132,7 @@ unloads it when switching profiles. `preload` loads the named profiles at server
 ## HTTP API
 
 - `POST /v1/jobs` submits an asynchronous job
+- `POST /v1/jobs/upload?task=…&model=…` streams a binary input into an asynchronous job
 - `GET /v1/jobs` and `GET /v1/jobs/:id` return persistent state
 - `GET /v1/jobs/:id/events` streams state changes as SSE
 - `GET /v1/jobs/:id/artifact` downloads the result
@@ -167,7 +168,7 @@ Commands:
 
 - `M-x modelmux-server-start`, `modelmux-server-status`, and `modelmux-server-stop`
 - `M-x modelmux-speak` generates speech for the active region, or the entire buffer when no region is active
-- `M-x modelmux-transcribe` selects an audio file and generates a text artifact
+- `M-x modelmux-transcribe` streams a selected audio file without blocking Emacs and generates a text artifact
 - `M-x modelmux-tasks` opens the live task and artifact table
 - `M-x modelmux-stop`
 

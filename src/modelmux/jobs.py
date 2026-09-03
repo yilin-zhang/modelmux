@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from modelmux.adapters import Adapter, load_adapter
 from modelmux.config import Profile, ProfileStore, ServerSettings
@@ -78,6 +79,41 @@ class JobManager:
         parameters: dict[str, Any] | None = None,
         output_path: Path | None = None,
     ) -> dict[str, Any]:
+        return self._submit(
+            task=task,
+            profile_name=profile_name,
+            parameters=parameters,
+            output_path=output_path,
+            stage=lambda path: path.write_bytes(input_bytes),
+        )
+
+    def submit_file(
+        self,
+        *,
+        task: str,
+        profile_name: str | None,
+        source: Path,
+        parameters: dict[str, Any] | None = None,
+        output_path: Path | None = None,
+    ) -> dict[str, Any]:
+        """Submit a staged file without retaining its contents in memory."""
+        return self._submit(
+            task=task,
+            profile_name=profile_name,
+            parameters=parameters,
+            output_path=output_path,
+            stage=lambda path: os.replace(source, path),
+        )
+
+    def _submit(
+        self,
+        *,
+        task: str,
+        profile_name: str | None,
+        parameters: dict[str, Any] | None,
+        output_path: Path | None,
+        stage: Callable[[Path], object],
+    ) -> dict[str, Any]:
         with self._lock:
             if self._stopping:
                 raise ModelMuxError("ModelMux server is stopping")
@@ -99,9 +135,19 @@ class JobManager:
             output_path=output_path,
         )
         run_id = str(record["id"])
+        input_path = self.runs.input_path(run_id, profile.input_extension)
+        try:
+            stage(input_path)
+            input_path.chmod(0o600)
+        except BaseException:
+            input_path.unlink(missing_ok=True)
+            self.runs.finish(run_id, "failed", message="Failed to stage input")
+            active_lock.close()
+            raise
         control = JobControl(threading.Event())
         with self._lock:
             if self._stopping:
+                input_path.unlink(missing_ok=True)
                 self.runs.finish(run_id, "cancelled", message="Server is stopping")
                 active_lock.close()
                 raise ModelMuxError("ModelMux server is stopping")
@@ -112,12 +158,13 @@ class JobManager:
                     record,
                     active_lock,
                     profile,
-                    input_bytes,
+                    input_path,
                     merged,
                     control,
                 )
             except RuntimeError as error:
                 self._controls.pop(run_id, None)
+                input_path.unlink(missing_ok=True)
                 self.runs.finish(run_id, "cancelled", message="Server is stopping")
                 active_lock.close()
                 raise ModelMuxError("ModelMux server is stopping") from error
@@ -128,7 +175,7 @@ class JobManager:
         record: dict[str, Any],
         active_lock,
         profile: Profile,
-        input_bytes: bytes,
+        input_path: Path,
         parameters: dict[str, Any],
         control: JobControl,
     ) -> None:
@@ -148,7 +195,7 @@ class JobManager:
                     active_lock=active_lock,
                     task=profile.task,
                     profile=profile,
-                    input_bytes=input_bytes,
+                    input_path=input_path,
                     parameters=parameters,
                     emit=null_sink,
                     cancelled=control.cancelled,
@@ -163,7 +210,7 @@ class JobManager:
                         active_lock=active_lock,
                         task=profile.task,
                         profile=profile,
-                        input_bytes=input_bytes,
+                        input_path=input_path,
                         parameters=parameters,
                         emit=null_sink,
                         cancelled=control.cancelled,
@@ -178,6 +225,7 @@ class JobManager:
                     str(record["id"]), "failed", message="Failed", error=str(error)
                 )
         finally:
+            input_path.unlink(missing_ok=True)
             if not execution_started:
                 active_lock.close()
             if self.settings.model_loading == "ephemeral" and adapter is not None:

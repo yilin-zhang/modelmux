@@ -105,6 +105,24 @@ def test_openai_compatible_speech_and_transcription(tmp_path: Path) -> None:
         assert result == {"text": "转录结果"}
 
 
+def test_binary_upload_creates_asynchronous_job(tmp_path: Path) -> None:
+    with running_server(tmp_path) as (client, manager):
+        body, content_type = client.request(
+            "POST",
+            "/v1/jobs/upload?task=asr&model=fake-asr",
+            body="转录结果".encode(),
+            content_type="application/octet-stream",
+        )
+        created = json.loads(body)
+        completed = client.wait(created["id"])
+
+        assert content_type == "application/json"
+        assert completed["status"] == "completed"
+        artifact, _ = client.request("GET", completed["artifact_url"])
+        assert artifact == "转录结果".encode()
+        assert not manager.runs.input_path(created["id"], ".wav").exists()
+
+
 def test_server_cancels_a_running_worker_without_stopping(tmp_path: Path) -> None:
     worker = tmp_path / "slow.py"
     worker.write_text(

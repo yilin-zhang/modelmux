@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import fcntl
 import signal
-import tempfile
 import threading
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -10,7 +9,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Generator
 
 from modelmux.adapters import Adapter, RunContext, RunResult, load_adapter
-from modelmux.config import Profile, cache_home
+from modelmux.config import Profile
 from modelmux.errors import ModelMuxError
 from modelmux.events import Event, EventSink
 from modelmux.runs import RunStore
@@ -40,7 +39,7 @@ def execute_created_run(
     active_lock: BinaryIO,
     task: str,
     profile: Profile,
-    input_bytes: bytes,
+    input_path: Path,
     parameters: dict[str, Any],
     emit: EventSink,
     cancelled: threading.Event | None = None,
@@ -51,12 +50,6 @@ def execute_created_run(
     run_id = str(record["id"])
     destination = Path(str(record["artifact"]))
     managed_output = bool(record["managed_artifact"])
-    input_config = profile.data.get("input", {})
-    suffix = (
-        str(input_config.get("extension", ".input"))
-        if isinstance(input_config, dict)
-        else ".input"
-    )
 
     def tracked_emit(event: Event) -> None:
         event = Event(event.type, {**event.data, "id": run_id})
@@ -98,22 +91,16 @@ def execute_created_run(
                     },
                 )
             )
-            scratch_root = cache_home() / "tmp"
-            scratch_root.mkdir(parents=True, exist_ok=True)
-            scratch_root.chmod(0o700)
-            with tempfile.TemporaryDirectory(prefix="run-", dir=scratch_root) as temporary:
-                input_path = Path(temporary) / f"input{suffix}"
-                input_path.write_bytes(input_bytes)
-                context = RunContext(
-                    task=task,
-                    profile=profile,
-                    input_path=input_path,
-                    output_path=destination,
-                    parameters=parameters,
-                    emit=tracked_emit,
-                    cancelled=cancelled,
-                )
-                result = (adapter or load_adapter(profile)).run(context)
+            context = RunContext(
+                task=task,
+                profile=profile,
+                input_path=input_path,
+                output_path=destination,
+                parameters=parameters,
+                emit=tracked_emit,
+                cancelled=cancelled,
+            )
+            result = (adapter or load_adapter(profile)).run(context)
         if cancelled is not None and cancelled.is_set():
             raise KeyboardInterrupt
         if managed_output:
@@ -140,6 +127,7 @@ def execute_created_run(
         store.finish(run_id, "failed", message="Failed", error=str(error))
         raise
     finally:
+        input_path.unlink(missing_ok=True)
         fcntl.flock(active_lock, fcntl.LOCK_UN)
         active_lock.close()
 
@@ -164,13 +152,22 @@ def run_profile(
         extension=profile.extension,
         output_path=output_path,
     )
+    input_path = store.input_path(str(record["id"]), profile.input_extension)
+    try:
+        input_path.write_bytes(input_bytes)
+        input_path.chmod(0o600)
+    except BaseException:
+        input_path.unlink(missing_ok=True)
+        store.finish(str(record["id"]), "failed", message="Failed to stage input")
+        active_lock.close()
+        raise
     return execute_created_run(
         store=store,
         record=record,
         active_lock=active_lock,
         task=task,
         profile=profile,
-        input_bytes=input_bytes,
+        input_path=input_path,
         parameters=parameters,
         emit=emit,
         serialize=True,
