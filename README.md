@@ -40,6 +40,19 @@ profiles:
       runtime_python: /path/to/python-with-mlx-qwen3-asr
 ```
 
+The built-in Qwen workers have isolated environments owned by this repository.
+Create them once, then point the corresponding user profile at the resulting
+Python executable:
+
+```sh
+uv sync --project runtimes/qwen3-tts
+uv sync --project runtimes/qwen3-asr
+```
+
+The executables are `runtimes/qwen3-tts/.venv/bin/python` and
+`runtimes/qwen3-asr/.venv/bin/python`. Keeping model-specific packages outside
+ModelMux's core environment avoids dependency conflicts between backends.
+
 Run the dependency-free integration profile:
 
 ```sh
@@ -154,6 +167,7 @@ Commands:
 
 - `M-x modelmux-server-start`, `modelmux-server-status`, and `modelmux-server-stop`
 - `M-x modelmux-speak` generates speech for the active region, or the entire buffer when no region is active
+- `M-x modelmux-transcribe` selects an audio file and generates a text artifact
 - `M-x modelmux-tasks` opens the live task and artifact table
 - `M-x modelmux-stop`
 

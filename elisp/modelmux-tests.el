@@ -39,6 +39,17 @@
       (should (equal started
                      (list "tts" "text to speak" modelmux-tts-profile))))))
 
+(ert-deftest modelmux-transcribe-submits-selected-audio-file ()
+  (let (started)
+    (cl-letf (((symbol-function 'file-regular-p) (lambda (_file) t))
+              ((symbol-function 'modelmux--file-base64)
+               (lambda (_file) "encoded-audio"))
+              ((symbol-function 'modelmux--start-run)
+               (lambda (&rest arguments) (setq started arguments))))
+      (modelmux-transcribe "/tmp/recording.wav"))
+    (should (equal started
+                   (list "asr" "encoded-audio" modelmux-asr-profile t)))))
+
 (ert-deftest modelmux-run-submits-directly-to-http-api ()
   (let (request)
     (cl-letf (((symbol-function 'modelmux--http-json-async)
@@ -49,6 +60,15 @@
     (should (equal (alist-get 'task (nth 2 request)) "tts"))
     (should (equal (alist-get 'model (nth 2 request)) "voice"))
     (should (equal (alist-get 'input (nth 2 request)) "文章"))))
+
+(ert-deftest modelmux-run-submits-binary-input-as-base64 ()
+  (let (request)
+    (cl-letf (((symbol-function 'modelmux--http-json-async)
+               (lambda (_method _path payload _callback)
+                 (setq request payload))))
+      (modelmux--start-run "asr" "encoded-audio" "asr-model" t))
+    (should (equal (alist-get 'input_base64 request) "encoded-audio"))
+    (should-not (assq 'input request))))
 
 (ert-deftest modelmux-task-entry-is-compact ()
   (let* ((modelmux--tasks (list (modelmux-test--task "abc")))

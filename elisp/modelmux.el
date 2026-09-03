@@ -34,6 +34,10 @@
   "Profile used by `modelmux-speak'."
   :type 'string)
 
+(defcustom modelmux-asr-profile "qwen3-asr-0.6b"
+  "Profile used by `modelmux-transcribe'."
+  :type 'string)
+
 (defcustom modelmux-tasks-refresh-interval 1.0
   "Seconds between task refreshes while the task buffer is visible."
   :type 'number)
@@ -89,6 +93,23 @@
     (when (string-empty-p text)
       (user-error "There is no text to read"))
     (modelmux--start-run "tts" text modelmux-tts-profile)))
+
+(defun modelmux--file-base64 (file)
+  "Return FILE contents encoded as single-line base64."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (base64-encode-string (buffer-string) t)))
+
+;;;###autoload
+(defun modelmux-transcribe (audio-file)
+  "Transcribe AUDIO-FILE using `modelmux-asr-profile'."
+  (interactive
+   (list (read-file-name "Audio file: " nil nil t nil #'file-regular-p)))
+  (unless (file-regular-p audio-file)
+    (user-error "Audio file does not exist: %s" audio-file))
+  (modelmux--start-run "asr" (modelmux--file-base64 audio-file)
+                       modelmux-asr-profile t))
 
 (defun modelmux--url (path)
   (concat (string-remove-suffix "/" modelmux-base-url) path))
@@ -186,11 +207,13 @@
         (when (derived-mode-p 'modelmux-tasks-mode)
           (modelmux-tasks-refresh))))))
 
-(defun modelmux--start-run (task input profile)
-  "Submit TASK with INPUT and PROFILE directly to the ModelMux HTTP API."
+(defun modelmux--start-run (task input profile &optional base64-encoded)
+  "Submit TASK with INPUT and PROFILE directly to the ModelMux HTTP API.
+When BASE64-ENCODED is non-nil, send INPUT as binary data encoded in base64."
   (modelmux--http-json-async
    "POST" "/v1/jobs"
-   `((task . ,task) (model . ,profile) (input . ,input)
+   `((task . ,task) (model . ,profile)
+     (,(if base64-encoded 'input_base64 'input) . ,input)
      (parameters . ,(make-hash-table :test 'equal)))
    (lambda (job)
      (modelmux--schedule-visible-refresh)
