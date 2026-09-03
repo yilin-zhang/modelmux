@@ -25,6 +25,7 @@ class RunContext:
 class RunResult:
     output_path: Path
     metadata: dict[str, Any]
+    run_id: str | None = None
 
 
 class Adapter(ABC):

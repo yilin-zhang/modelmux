@@ -1,14 +1,36 @@
 from __future__ import annotations
 
+import fcntl
+import signal
 import tempfile
-import uuid
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from modelmux.adapters import RunContext, RunResult, load_adapter
 from modelmux.config import Profile, cache_home
 from modelmux.errors import ModelMuxError
 from modelmux.events import Event, EventSink
+from modelmux.runs import RunStore
+
+
+@contextmanager
+def _cancel_on_sigterm() -> Iterator[None]:
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def cancel(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, cancel)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def run_profile(
@@ -24,42 +46,105 @@ def run_profile(
         raise ModelMuxError(
             f"Profile {profile.name!r} handles {profile.task!r}, not {task!r}"
         )
-    managed_output = output_path is None
-    destination = output_path or (
-        cache_home() / "runs" / f"{uuid.uuid4().hex}{profile.extension}"
+    store = RunStore()
+    record, active_lock = store.create(
+        task=task,
+        profile=profile.name,
+        extension=profile.extension,
+        output_path=output_path,
     )
-    destination = destination.expanduser().resolve()
+    run_id = str(record["id"])
+    destination = Path(str(record["artifact"]))
+    managed_output = bool(record["managed_artifact"])
     input_config = profile.data.get("input", {})
-    suffix = str(input_config.get("extension", ".input")) if isinstance(input_config, dict) else ".input"
-    emit(Event("started", {"task": task, "profile": profile.name, "message": f"Loading {profile.name}…"}))
-    scratch_root = cache_home() / "tmp"
-    scratch_root.mkdir(parents=True, exist_ok=True)
-    scratch_root.chmod(0o700)
-    with tempfile.TemporaryDirectory(prefix="run-", dir=scratch_root) as temporary:
-        input_path = Path(temporary) / f"input{suffix}"
-        input_path.write_bytes(input_bytes)
-        context = RunContext(
-            task=task,
-            profile=profile,
-            input_path=input_path,
-            output_path=destination,
-            parameters=parameters,
-            emit=emit,
-        )
-        result = load_adapter(profile).run(context)
-    if managed_output:
-        result.output_path.parent.chmod(0o700)
-        result.output_path.chmod(0o600)
-    emit(
-        Event(
-            "result",
-            {
-                "task": task,
-                "profile": profile.name,
-                "output": str(result.output_path),
-                "metadata": result.metadata,
-                "message": str(result.output_path),
-            },
-        )
+    suffix = (
+        str(input_config.get("extension", ".input"))
+        if isinstance(input_config, dict)
+        else ".input"
     )
-    return result
+
+    def tracked_emit(event: Event) -> None:
+        event = Event(event.type, {**event.data, "id": run_id})
+        store.record_event(run_id, event)
+        try:
+            emit(event)
+        except BrokenPipeError:
+            # The caller may disappear while a local model is still finishing.
+            # Keep the durable run authoritative instead of failing the work.
+            pass
+
+    try:
+        tracked_emit(
+            Event(
+                "queued",
+                {
+                    "task": task,
+                    "profile": profile.name,
+                    "name": run_id,
+                    "message": "Queued",
+                },
+            )
+        )
+        with _cancel_on_sigterm(), store.queue_slot():
+            store.update(
+                run_id,
+                status="running",
+                message=f"Loading {profile.name}…",
+                started_at=datetime.now(timezone.utc).isoformat(),
+            )
+            tracked_emit(
+                Event(
+                    "started",
+                    {
+                        "task": task,
+                        "profile": profile.name,
+                        "message": f"Loading {profile.name}…",
+                    },
+                )
+            )
+            scratch_root = cache_home() / "tmp"
+            scratch_root.mkdir(parents=True, exist_ok=True)
+            scratch_root.chmod(0o700)
+            with tempfile.TemporaryDirectory(prefix="run-", dir=scratch_root) as temporary:
+                input_path = Path(temporary) / f"input{suffix}"
+                input_path.write_bytes(input_bytes)
+                context = RunContext(
+                    task=task,
+                    profile=profile,
+                    input_path=input_path,
+                    output_path=destination,
+                    parameters=parameters,
+                    emit=tracked_emit,
+                )
+                result = load_adapter(profile).run(context)
+        if managed_output:
+            result.output_path.parent.chmod(0o700)
+            result.output_path.chmod(0o600)
+        store.finish(
+            run_id,
+            "completed",
+            message="Completed",
+            metadata=result.metadata,
+        )
+        tracked_emit(
+            Event(
+                "result",
+                {
+                    "task": task,
+                    "profile": profile.name,
+                    "output": str(result.output_path),
+                    "metadata": result.metadata,
+                    "message": "Completed",
+                },
+            )
+        )
+        return RunResult(result.output_path, result.metadata, run_id)
+    except KeyboardInterrupt:
+        store.finish(run_id, "cancelled", message="Cancelled")
+        raise
+    except Exception as error:
+        store.finish(run_id, "failed", message="Failed", error=str(error))
+        raise
+    finally:
+        fcntl.flock(active_lock, fcntl.LOCK_UN)
+        active_lock.close()

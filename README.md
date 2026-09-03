@@ -42,6 +42,20 @@ Run the dependency-free integration profile:
 printf 'hello' | uv run modelmux run copy --profile copy
 ```
 
+Every invocation creates a persistent run record. Managed outputs live beside their
+metadata under `runs/<uuid>/`; input contents and resolved parameters are not recorded.
+Python also serializes runs so concurrent frontends cannot load multiple models at once.
+
+```sh
+modelmux runs list --json
+modelmux runs rename RUN_ID "Article title" --json
+modelmux runs cancel RUN_ID --json
+modelmux runs delete RUN_ID --json
+```
+
+Deleting a managed run removes its artifact. An explicit `--output` remains
+caller-owned and is not deleted with the run record. Runs are never pruned automatically.
+
 ## Profiles
 
 Put YAML or JSON profiles in `~/.config/modelmux/profiles/`. A profile either names
@@ -106,19 +120,22 @@ developing:
 
 Commands:
 
-- `M-x modelmux-speak` reads the active region, or the entire buffer when no region is active
+- `M-x modelmux-speak` generates speech for the active region, or the entire buffer when no region is active
 - `M-x modelmux-tasks` opens the live task and artifact table
 - `M-x modelmux-stop`
 
-The task table uses `RET` to open or play an artifact inside Emacs, `o` to open it
-with the macOS default app, `O` to open its directory in Finder, `k` to cancel a
-queued or running task, and `g` to refresh. Heavy model jobs are serialized locally
-so queued tasks cannot load several copies of the same model into memory.
+Speech generation does not start playback automatically. The task table uses `RET` or
+`o` to open an artifact with the system default app, `O` to open its directory,
+`e` to rename, and `k` to cancel. Mark rows with `m`, unmark with `u` or `U`, and
+delete the marked rows (or the current row) with `D`. `g` refreshes immediately;
+visible task buffers also refresh automatically. The UI reads and mutates runs only
+through the ModelMux CLI.
 
 ## Local files
 
 - Configuration: `~/.config/modelmux/`
-- Generated outputs and scratch space on macOS: `~/Library/Caches/modelmux/`
+- Run metadata and managed outputs on macOS: `~/Library/Caches/modelmux/runs/<uuid>/`
+- Scratch space on macOS: `~/Library/Caches/modelmux/tmp/`
 
 ModelMux has no telemetry and performs no network requests itself. Individual model
 adapters and their dependencies may download models; each adapter should document that
@@ -133,4 +150,5 @@ variables to child processes. Secrets must be opted into explicitly by an adapte
 
 Generated files in ModelMux's managed cache are user-only (`0600`) and its runtime
 directories are `0700`. Files written to an explicit `--output` path keep the caller's
-normal permissions. User configuration and model weights are ignored by git.
+normal permissions. Run metadata is written atomically and does not contain input
+contents or merged profile parameters. User configuration and model weights are ignored by git.

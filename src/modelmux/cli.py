@@ -11,9 +11,10 @@ from modelmux.config import ProfileStore, apply_overrides
 from modelmux.errors import ModelMuxError
 from modelmux.events import stderr_sink
 from modelmux.runtime import run_profile
+from modelmux.runs import RunStore
 
 
-TASK_ALIASES = ("tts", "asr", "chat", "image", "embed")
+TASK_ALIASES = ("tts", "asr", "ocr", "chat", "image", "embed")
 
 
 def add_run_arguments(parser: argparse.ArgumentParser, *, include_task: bool) -> None:
@@ -39,6 +40,23 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("profiles", help="List available profiles")
     inspect = commands.add_parser("inspect", help="Print a resolved profile")
     inspect.add_argument("profile")
+    runs = commands.add_parser("runs", help="Manage persistent runs")
+    run_commands = runs.add_subparsers(dest="runs_command", required=True)
+    run_list = run_commands.add_parser("list", help="List runs")
+    run_list.add_argument("--json", action="store_true")
+    run_show = run_commands.add_parser("show", help="Show one run")
+    run_show.add_argument("id")
+    run_show.add_argument("--json", action="store_true")
+    run_rename = run_commands.add_parser("rename", help="Rename one run")
+    run_rename.add_argument("id")
+    run_rename.add_argument("name")
+    run_rename.add_argument("--json", action="store_true")
+    run_delete = run_commands.add_parser("delete", help="Delete completed runs")
+    run_delete.add_argument("ids", nargs="+")
+    run_delete.add_argument("--json", action="store_true")
+    run_cancel = run_commands.add_parser("cancel", help="Cancel active runs")
+    run_cancel.add_argument("ids", nargs="+")
+    run_cancel.add_argument("--json", action="store_true")
     return root
 
 
@@ -67,6 +85,7 @@ def _run(arguments: argparse.Namespace, store: ProfileStore) -> int:
         emit=stderr_sink(arguments.json_events),
     )
     payload: dict[str, Any] = {
+        "id": result.run_id,
         "task": arguments.task,
         "profile": profile.name,
         "output": str(result.output_path),
@@ -76,7 +95,46 @@ def _run(arguments: argparse.Namespace, store: ProfileStore) -> int:
     return 0
 
 
+def _print_runs(value: Any, *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(value, ensure_ascii=False))
+        return
+    records = value if isinstance(value, list) else [value]
+    for record in records:
+        if isinstance(record, dict):
+            print(
+                "\t".join(
+                    str(record.get(key, ""))
+                    for key in ("id", "name", "task", "profile", "status", "progress")
+                )
+            )
+
+
+def _runs(arguments: argparse.Namespace) -> int:
+    store = RunStore()
+    if arguments.runs_command == "list":
+        _print_runs(store.list(), json_output=arguments.json)
+        return 0
+    if arguments.runs_command == "show":
+        _print_runs(store.get(arguments.id), json_output=arguments.json)
+        return 0
+    if arguments.runs_command == "rename":
+        _print_runs(store.rename(arguments.id, arguments.name), json_output=arguments.json)
+        return 0
+    if arguments.runs_command == "delete":
+        store.delete_many(arguments.ids)
+        _print_runs({"deleted": arguments.ids}, json_output=arguments.json)
+        return 0
+    if arguments.runs_command == "cancel":
+        records = [store.cancel(run_id) for run_id in arguments.ids]
+        _print_runs(records, json_output=arguments.json)
+        return 0
+    raise ModelMuxError(f"Unknown runs command: {arguments.runs_command}")
+
+
 def execute(arguments: argparse.Namespace) -> int:
+    if arguments.command == "runs":
+        return _runs(arguments)
     store = ProfileStore()
     if arguments.command == "profiles":
         for profile in store.all():
