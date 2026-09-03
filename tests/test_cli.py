@@ -6,12 +6,13 @@ from types import SimpleNamespace
 from modelmux.cli import execute, parser
 from modelmux.adapters.command import CommandAdapter
 from modelmux.adapters.base import RunContext
-from modelmux.config import Profile
 from modelmux.events import Event, null_sink
 from modelmux.runtime import run_profile
 
+from conftest import make_profile
 
-def test_copy_adapter_end_to_end(tmp_path: Path, monkeypatch, capsys) -> None:
+
+def test_run_command_downloads_artifact_and_prints_json(tmp_path: Path, monkeypatch, capsys) -> None:
     source = tmp_path / "source.txt"
     output = tmp_path / "output.txt"
     source.write_text("模型接口", encoding="utf-8")
@@ -54,22 +55,10 @@ def test_profiles_lists_builtins(capsys, monkeypatch) -> None:
     assert "qwen3-tts-0.6b-base-8bit\ttts" in output
 
 
-def test_managed_outputs_are_private(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("MODELMUX_CACHE_HOME", str(tmp_path / "cache"))
-    profile = Profile(
-        "copy-test",
-        "test",
-        {
-            "task": "copy",
-            "adapter": "copy",
-            "defaults": {},
-            "input": {"extension": ".txt"},
-            "output": {"extension": ".txt"},
-        },
-    )
+def test_managed_outputs_are_private(cache: Path, copy_profile) -> None:
     result = run_profile(
         task="copy",
-        profile=profile,
+        profile=copy_profile,
         input_bytes=b"private",
         output_path=None,
         parameters={},
@@ -79,26 +68,19 @@ def test_managed_outputs_are_private(tmp_path: Path, monkeypatch) -> None:
     assert stat.S_IMODE(result.output_path.parent.stat().st_mode) == 0o700
 
 
-def test_command_adapter_does_not_inherit_secrets(tmp_path: Path, monkeypatch) -> None:
+def test_command_adapter_does_not_inherit_secrets(tmp_path: Path, cache: Path, monkeypatch) -> None:
     worker = tmp_path / "worker.py"
     worker.write_text(
         "import os, pathlib, sys\n"
         "pathlib.Path(sys.argv[1]).write_text(os.environ.get('MODELMUX_TEST_SECRET', 'missing'))\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODELMUX_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("MODELMUX_TEST_SECRET", "do-not-leak")
-    profile = Profile(
+    profile = make_profile(
         "command-test",
-        "test",
-        {
-            "task": "test",
-            "adapter": "command",
-            "defaults": {},
-            "input": {"extension": ".txt"},
-            "output": {"extension": ".txt"},
-            "command": {"argv": [sys.executable, str(worker), "{output_path}"]},
-        },
+        task="test",
+        adapter="command",
+        command={"argv": [sys.executable, str(worker), "{output_path}"]},
     )
     result = run_profile(
         task="test",
@@ -111,7 +93,7 @@ def test_command_adapter_does_not_inherit_secrets(tmp_path: Path, monkeypatch) -
     assert result.output_path.read_text(encoding="utf-8") == "missing"
 
 
-def test_command_adapter_streams_json_events(tmp_path: Path, monkeypatch) -> None:
+def test_command_adapter_streams_json_events(tmp_path: Path, cache: Path) -> None:
     worker = tmp_path / "worker.py"
     worker.write_text(
         "import json, pathlib, sys\n"
@@ -119,20 +101,13 @@ def test_command_adapter_streams_json_events(tmp_path: Path, monkeypatch) -> Non
         "pathlib.Path(sys.argv[1]).write_text('done')\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODELMUX_CACHE_HOME", str(tmp_path / "cache"))
-    profile = Profile(
+    profile = make_profile(
         "event-test",
-        "test",
-        {
-            "task": "test",
-            "adapter": "command",
-            "defaults": {},
-            "input": {"extension": ".txt"},
-            "output": {"extension": ".txt"},
-            "command": {
-                "events": "jsonl",
-                "argv": [sys.executable, str(worker), "{output_path}"],
-            },
+        task="test",
+        adapter="command",
+        command={
+            "events": "jsonl",
+            "argv": [sys.executable, str(worker), "{output_path}"],
         },
     )
     events: list[Event] = []
@@ -162,17 +137,12 @@ def test_command_adapter_reuses_persistent_worker(tmp_path: Path) -> None:
         " print(json.dumps({'type': 'result'}), flush=True)\n",
         encoding="utf-8",
     )
-    profile = Profile(
+    profile = make_profile(
         "persistent-test",
-        "test",
-        {
-            "task": "copy",
-            "adapter": "command",
-            "defaults": {},
-            "command": {
-                "worker_argv": [sys.executable, str(worker), str(counter)],
-                "argv": [sys.executable, str(worker), str(counter)],
-            },
+        adapter="command",
+        command={
+            "worker_argv": [sys.executable, str(worker), str(counter)],
+            "argv": [sys.executable, str(worker), str(counter)],
         },
     )
     adapter = CommandAdapter(profile)

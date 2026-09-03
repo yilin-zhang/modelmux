@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, BinaryIO, Generator
 
 from modelmux.adapters import Adapter, RunContext, RunResult, load_adapter
@@ -132,6 +133,26 @@ def execute_created_run(
         active_lock.close()
 
 
+def stage_input(
+    store: RunStore,
+    run_id: str,
+    extension: str,
+    active_lock: BinaryIO,
+    stage: Callable[[Path], object],
+) -> Path:
+    """Write a run's input privately, failing the run and releasing its lock on error."""
+    input_path = store.input_path(run_id, extension)
+    try:
+        stage(input_path)
+        input_path.chmod(0o600)
+    except BaseException:
+        input_path.unlink(missing_ok=True)
+        store.finish(run_id, "failed", message="Failed to stage input")
+        active_lock.close()
+        raise
+    return input_path
+
+
 def run_profile(
     *,
     task: str,
@@ -152,15 +173,13 @@ def run_profile(
         extension=profile.extension,
         output_path=output_path,
     )
-    input_path = store.input_path(str(record["id"]), profile.input_extension)
-    try:
-        input_path.write_bytes(input_bytes)
-        input_path.chmod(0o600)
-    except BaseException:
-        input_path.unlink(missing_ok=True)
-        store.finish(str(record["id"]), "failed", message="Failed to stage input")
-        active_lock.close()
-        raise
+    input_path = stage_input(
+        store,
+        str(record["id"]),
+        profile.input_extension,
+        active_lock,
+        lambda path: path.write_bytes(input_bytes),
+    )
     return execute_created_run(
         store=store,
         record=record,

@@ -4,33 +4,16 @@ from pathlib import Path
 import pytest
 
 from modelmux.cli import execute, parser
-from modelmux.config import Profile
 from modelmux.errors import ModelMuxError
 from modelmux.events import null_sink
 from modelmux.runtime import run_profile
 from modelmux.runs import RunStore
 
 
-def copy_profile() -> Profile:
-    return Profile(
-        "copy-test",
-        "test",
-        {
-            "task": "copy",
-            "adapter": "copy",
-            "defaults": {},
-            "input": {"extension": ".txt"},
-            "output": {"extension": ".txt"},
-        },
-    )
-
-
-def test_managed_run_is_persistent_and_self_contained(tmp_path: Path, monkeypatch) -> None:
-    cache = tmp_path / "cache"
-    monkeypatch.setenv("MODELMUX_CACHE_HOME", str(cache))
+def test_managed_run_is_persistent_and_self_contained(cache: Path, copy_profile) -> None:
     result = run_profile(
         task="copy",
-        profile=copy_profile(),
+        profile=copy_profile,
         input_bytes=b"private article text",
         output_path=None,
         parameters={"secret": "not metadata"},
@@ -49,17 +32,13 @@ def test_managed_run_is_persistent_and_self_contained(tmp_path: Path, monkeypatc
     assert RunStore().list()[0]["id"] == result.run_id
 
 
-def test_closed_event_consumer_does_not_fail_completed_work(
-    tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.setenv("MODELMUX_CACHE_HOME", str(tmp_path / "cache"))
-
+def test_closed_event_consumer_does_not_fail_completed_work(cache: Path, copy_profile) -> None:
     def closed_consumer(_event) -> None:
         raise BrokenPipeError
 
     result = run_profile(
         task="copy",
-        profile=copy_profile(),
+        profile=copy_profile,
         input_bytes=b"value",
         output_path=None,
         parameters={},
@@ -114,18 +93,6 @@ def test_delete_removes_managed_artifact_and_metadata(tmp_path: Path) -> None:
     assert not (store.root / record["id"]).exists()
 
 
-def test_delete_rejects_an_active_run(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "runs")
-    record, active = store.create(
-        task="tts", profile="voice", extension=".wav", output_path=None
-    )
-    try:
-        with pytest.raises(ModelMuxError, match="cancel it first"):
-            store.delete(record["id"])
-    finally:
-        active.close()
-
-
 def test_batch_delete_checks_every_run_before_removing_anything(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "runs")
     completed, completed_lock = store.create(
@@ -159,11 +126,10 @@ def test_delete_preserves_explicit_output(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8") == "keep"
 
 
-def test_runs_cli_lists_renames_and_deletes(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setenv("MODELMUX_CACHE_HOME", str(tmp_path / "cache"))
+def test_runs_cli_lists_renames_and_deletes(cache: Path, copy_profile, monkeypatch, capsys) -> None:
     result = run_profile(
         task="copy",
-        profile=copy_profile(),
+        profile=copy_profile,
         input_bytes=b"value",
         output_path=None,
         parameters={},

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
+import shutil
 import sys
 import time
 import uuid
@@ -12,6 +14,10 @@ from urllib.request import Request, urlopen
 
 from modelmux.config import ServerSettings
 from modelmux.errors import ModelMuxError
+from modelmux.runs import FINAL_STATUSES
+
+
+NOT_RUNNING = "ModelMux server is not running; start it with `modelmux server start`"
 
 
 class ModelMuxClient:
@@ -40,16 +46,18 @@ class ModelMuxClient:
             with urlopen(request, timeout=timeout) as response:
                 return response.read(), response.headers.get_content_type()
         except HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            try:
-                message = json.loads(detail)["error"]["message"]
-            except (json.JSONDecodeError, KeyError, TypeError):
-                message = detail or str(error)
-            raise ModelMuxError(str(message)) from error
+            raise ModelMuxError(self._error_message(error)) from error
         except (OSError, URLError) as error:
-            raise ModelMuxError(
-                "ModelMux server is not running; start it with `modelmux server start`"
-            ) from error
+            raise ModelMuxError(NOT_RUNNING) from error
+
+    @staticmethod
+    def _error_message(error: HTTPError) -> str:
+        """Extract a ModelMux error message from an HTTP error response."""
+        detail = error.read().decode("utf-8", errors="replace")
+        try:
+            return str(json.loads(detail)["error"]["message"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return detail or str(error)
 
     def json(
         self,
@@ -74,8 +82,6 @@ class ModelMuxClient:
         input_bytes: bytes,
         parameters: dict[str, Any],
     ) -> dict[str, Any]:
-        import base64
-
         payload: dict[str, Any] = {
             "task": task,
             "model": model,
@@ -97,15 +103,26 @@ class ModelMuxClient:
             if events and marker != previous:
                 print(value.get("message") or value.get("status"), file=sys.stderr)
                 previous = marker
-            if value.get("status") in {"completed", "failed", "cancelled", "interrupted"}:
+            if value.get("status") in FINAL_STATUSES:
                 return value
             time.sleep(0.25)
 
     def download(self, run_id: str, destination: Path) -> Path:
-        body, _content_type = self.request("GET", f"/v1/jobs/{run_id}/artifact", timeout=None)
+        """Stream an artifact to DESTINATION without holding it in memory."""
         destination = destination.expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(body)
+        request = Request(
+            f"{self.settings.base_url}/v1/jobs/{run_id}/artifact",
+            headers={"Accept": "application/octet-stream"},
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=None) as response, destination.open("wb") as output:
+                shutil.copyfileobj(response, output, 1024 * 1024)
+        except HTTPError as error:
+            raise ModelMuxError(self._error_message(error)) from error
+        except (OSError, URLError) as error:
+            raise ModelMuxError(NOT_RUNNING) from error
         return destination
 
     def transcribe(self, model: str, source: Path) -> dict[str, Any]:

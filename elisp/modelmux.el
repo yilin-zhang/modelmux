@@ -6,12 +6,27 @@
 
 ;;; Commentary:
 
-;; A thin Emacs frontend for ModelMux's persistent run registry.
+;; A thin Emacs frontend for ModelMux's persistent run registry.  Emacs talks
+;; to the local gateway over HTTP; the `modelmux' CLI is used only to start and
+;; stop the detached server.
+;;
+;; Point Emacs at a running gateway and load this file:
+;;
+;;   (setq modelmux-base-url "http://127.0.0.1:8765")
+;;   (require 'modelmux)
+;;
+;; Entry points: `modelmux-server-start', `modelmux-server-status' and
+;; `modelmux-server-stop' manage the gateway; `modelmux-speak' reads the region
+;; or buffer aloud; `modelmux-transcribe' streams an audio file for ASR;
+;; `modelmux-stop' cancels the first active run; and `modelmux-tasks' opens a
+;; live table of runs and their artifacts.
+;;
+;; In the task table, RET or `o' opens an artifact with the system default
+;; application, `O' opens its directory, `e' renames, `k' cancels, `m'/`u'/`U'
+;; manage marks, `D' deletes the marked runs, and `g' refreshes.
 
 ;;; Code:
 
-(require 'cl-lib)
-(require 'json)
 (require 'seq)
 (require 'subr-x)
 (require 'tabulated-list)
@@ -73,9 +88,12 @@
   :group 'modelmux)
 
 (defface modelmux-mark-indicator-face
-  '((t :inherit warning :weight bold :background reset))
+  '((t :inherit warning :weight bold :background unspecified))
   "Face for the mark indicator."
   :group 'modelmux)
+
+(defconst modelmux--active-statuses '("queued" "running")
+  "Run statuses that have not reached a final state.")
 
 (defvar modelmux--tasks nil
   "Most recently fetched ModelMux task records.")
@@ -85,8 +103,11 @@
   "Hash table of marked task IDs in the current task-list buffer.")
 (defvar-local modelmux--refresh-timer nil
   "Refresh timer for the current task-list buffer.")
-(defvar-local modelmux--refresh-request nil
-  "Active HTTP refresh buffer for the current task-list buffer.")
+;; `define-derived-mode' calls `kill-all-local-variables', which would otherwise
+;; drop the timer without cancelling it when the mode is re-entered.
+(put 'modelmux--refresh-timer 'permanent-local t)
+(defvar-local modelmux--refresh-in-flight nil
+  "Non-nil while a task refresh request is outstanding.")
 
 (defun modelmux--buffer-text ()
   "Return the active region, or the entire current buffer."
@@ -118,20 +139,16 @@
   (concat (string-remove-suffix "/" modelmux-base-url) path))
 
 (defun modelmux--http-body-start ()
-  "Move point to the start of the current HTTP response body."
+  "Move point to the start of the current HTTP response body and return it."
   (goto-char (point-min))
-  (or (and (boundp 'url-http-end-of-headers) url-http-end-of-headers)
-      (progn
-        (re-search-forward "\r?\n\r?\n" nil t)
-        (point))
-      (point-min)))
+  (goto-char (or (bound-and-true-p url-http-end-of-headers)
+                 (if (re-search-forward "\r?\n\r?\n" nil t) (point) (point-min))))
+  (point))
 
 (defun modelmux--http-json-from-current-buffer ()
   "Parse a ModelMux JSON response from the current URL buffer."
-  (let ((status (or (and (boundp 'url-http-response-status)
-                         url-http-response-status)
-                    0)))
-    (goto-char (modelmux--http-body-start))
+  (let ((status (or (bound-and-true-p url-http-response-status) 0)))
+    (modelmux--http-body-start)
     (let ((payload
            (json-parse-buffer :object-type 'alist :array-type 'list
                               :null-object nil :false-object nil)))
@@ -139,7 +156,7 @@
         (let* ((error-object (alist-get 'error payload))
                (message (and (listp error-object)
                              (alist-get 'message error-object))))
-          (error "ModelMux: %s" (or message (format "HTTP %s" status)))))
+          (user-error "ModelMux: %s" (or message (format "HTTP %s" status)))))
       payload)))
 
 (defun modelmux--http-json-sync (method path &optional payload)
@@ -159,8 +176,9 @@
         (with-current-buffer buffer (modelmux--http-json-from-current-buffer))
       (kill-buffer buffer))))
 
-(defun modelmux--http-json-async (method path payload callback)
-  "Send JSON PAYLOAD using METHOD to PATH, then call CALLBACK."
+(defun modelmux--http-json-async (method path payload callback &optional finally)
+  "Send JSON PAYLOAD using METHOD to PATH, then call CALLBACK.
+FINALLY, when given, runs after CALLBACK on every outcome."
   (let ((url-request-method method)
         (url-request-extra-headers '(("Content-Type" . "application/json")))
         (url-request-data (and payload (encode-coding-string
@@ -175,6 +193,7 @@
                             (plist-get status :error))
                  (funcall callback (modelmux--http-json-from-current-buffer)))
              (error (message "%s" (error-message-string error))))
+         (when finally (funcall finally))
          (kill-buffer (current-buffer))))
      nil t t)))
 
@@ -208,11 +227,11 @@
   (interactive)
   (message "%s" (modelmux--server-command "status")))
 
-(defun modelmux--schedule-visible-refresh ()
-  "Refresh the task buffer when it is visible."
-  (when-let* ((buffer (get-buffer modelmux--tasks-buffer)))
-    (when (get-buffer-window buffer t)
-      (with-current-buffer buffer
+(defun modelmux--refresh-if-visible (&optional buffer)
+  "Refresh BUFFER, or the task buffer, when it is a visible task list."
+  (when-let* ((target (or buffer (get-buffer modelmux--tasks-buffer))))
+    (when (and (buffer-live-p target) (get-buffer-window target t))
+      (with-current-buffer target
         (when (derived-mode-p 'modelmux-tasks-mode)
           (modelmux-tasks-refresh))))))
 
@@ -223,15 +242,14 @@
    `((task . ,task) (model . ,profile) (input . ,text)
      (parameters . ,(make-hash-table :test 'equal)))
    (lambda (job)
-     (modelmux--schedule-visible-refresh)
+     (modelmux--refresh-if-visible)
      (message "ModelMux %s job %s queued" (upcase task) (alist-get 'id job)))))
 
 (defun modelmux--upload-url (task profile)
   "Return the binary upload URL for TASK and PROFILE."
-  (format "%s/v1/jobs/upload?task=%s&model=%s"
-          (string-remove-suffix "/" modelmux-base-url)
-          (url-hexify-string task)
-          (url-hexify-string profile)))
+  (modelmux--url (format "/v1/jobs/upload?task=%s&model=%s"
+                         (url-hexify-string task)
+                         (url-hexify-string profile))))
 
 (defun modelmux--upload-sentinel (process _event)
   "Handle completion of a ModelMux file upload PROCESS."
@@ -242,10 +260,13 @@
           (if (zerop (process-exit-status process))
               (with-current-buffer buffer
                 (goto-char (point-min))
-                (let ((job (json-parse-buffer :object-type 'alist)))
-                  (modelmux--schedule-visible-refresh)
-                  (message "ModelMux %s job %s queued"
-                           (upcase task) (alist-get 'id job))))
+                (condition-case error
+                    (let ((job (json-parse-buffer :object-type 'alist)))
+                      (modelmux--refresh-if-visible)
+                      (message "ModelMux %s job %s queued"
+                               (upcase task) (alist-get 'id job)))
+                  (error (message "ModelMux upload returned an invalid reply: %s"
+                                  (error-message-string error)))))
             (message "ModelMux upload failed: %s"
                      (string-trim
                       (with-current-buffer buffer (buffer-string)))))
@@ -357,13 +378,14 @@
 (defun modelmux--apply-marks ()
   "Redraw overlays for marked tasks in the current buffer."
   (remove-overlays (point-min) (point-max) 'modelmux-mark t)
-  (save-excursion
-    (goto-char (point-min))
-    (while (< (point) (point-max))
-      (when-let* ((id (tabulated-list-get-id)))
-        (when (gethash id modelmux--marked)
-          (modelmux--add-mark-overlay)))
-      (forward-line 1))))
+  (unless (zerop (hash-table-count modelmux--marked))
+    (save-excursion
+      (goto-char (point-min))
+      (while (< (point) (point-max))
+        (when-let* ((id (tabulated-list-get-id)))
+          (when (gethash id modelmux--marked)
+            (modelmux--add-mark-overlay)))
+        (forward-line 1)))))
 
 (defun modelmux--add-mark-overlay ()
   "Add a mark overlay to the task row at point."
@@ -398,34 +420,45 @@
 
 (defun modelmux--prune-marks ()
   "Discard marks for tasks absent from the latest response."
-  (let (stale)
-    (maphash (lambda (id _value)
-               (unless (modelmux--task-by-id id) (push id stale)))
-             modelmux--marked)
-    (dolist (id stale) (remhash id modelmux--marked))))
+  (unless (zerop (hash-table-count modelmux--marked))
+    (let ((present (make-hash-table :test 'equal))
+          stale)
+      (dolist (task modelmux--tasks)
+        (puthash (alist-get 'id task) t present))
+      (maphash (lambda (id _value)
+                 (unless (gethash id present) (push id stale)))
+               modelmux--marked)
+      (dolist (id stale) (remhash id modelmux--marked)))))
+
+(defun modelmux--task-active-p (task)
+  "Return non-nil when TASK has not reached a final status."
+  (member (alist-get 'status task) modelmux--active-statuses))
+
+(defun modelmux--accept-tasks (tasks)
+  "Store TASKS and redraw the table when the display would change.
+An unchanged list of finished runs renders identically, so it is left alone;
+active runs are redrawn regardless because their elapsed time advances."
+  (unless (and (equal tasks modelmux--tasks)
+               (not (seq-some #'modelmux--task-active-p tasks)))
+    (setq modelmux--tasks tasks)
+    (modelmux--prune-marks)
+    (modelmux--print-preserving-position)))
 
 (defun modelmux-tasks-refresh ()
   "Reload runs asynchronously and redraw the task table."
   (interactive)
-  (unless (buffer-live-p modelmux--refresh-request)
+  (unless modelmux--refresh-in-flight
     (let ((target (current-buffer)))
-      (setq modelmux--refresh-request
-            (modelmux--http-json-async
-             "GET" "/v1/jobs" nil
-             (lambda (tasks)
-               (when (buffer-live-p target)
-                 (with-current-buffer target
-                   (setq modelmux--refresh-request nil
-                         modelmux--tasks tasks)
-                   (modelmux--prune-marks)
-                   (modelmux--print-preserving-position)))))))))
-
-(defun modelmux--timer-refresh (buffer)
-  "Refresh task-list BUFFER when it remains visible."
-  (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
-    (with-current-buffer buffer
-      (when (derived-mode-p 'modelmux-tasks-mode)
-        (modelmux-tasks-refresh)))))
+      (setq modelmux--refresh-in-flight t)
+      (modelmux--http-json-async
+       "GET" "/v1/jobs" nil
+       (lambda (tasks)
+         (when (buffer-live-p target)
+           (with-current-buffer target (modelmux--accept-tasks tasks))))
+       (lambda ()
+         (when (buffer-live-p target)
+           (with-current-buffer target
+             (setq modelmux--refresh-in-flight nil))))))))
 
 (defun modelmux--task-id-at-point ()
   "Return the task ID at point or signal a user error."
@@ -433,18 +466,14 @@
 
 (defun modelmux--mark-region (beginning end)
   "Mark task rows between BEGINNING and END."
-  (let ((finish (if (and (> end beginning)
-                         (save-excursion (goto-char end) (bolp)))
-                    (1- end)
-                  end)))
-    (save-excursion
-      (goto-char beginning)
-      (beginning-of-line)
-      (while (<= (line-beginning-position) finish)
-        (when-let* ((id (tabulated-list-get-id)))
-          (puthash id t modelmux--marked)
-          (modelmux--add-mark-overlay))
-        (forward-line 1)))))
+  (save-excursion
+    (goto-char beginning)
+    (beginning-of-line)
+    (while (< (point) end)
+      (when-let* ((id (tabulated-list-get-id)))
+        (puthash id t modelmux--marked)
+        (modelmux--add-mark-overlay))
+      (forward-line 1))))
 
 (defun modelmux-task-mark ()
   "Mark the current task or all tasks in the active region."
@@ -503,7 +532,7 @@
            (if (plist-get status :error)
                (message "Cannot download ModelMux artifact: %s"
                         (plist-get status :error))
-             (let ((response-status url-http-response-status))
+             (let ((response-status (or (bound-and-true-p url-http-response-status) 0)))
                (if (>= response-status 400)
                    (message "Cannot download ModelMux artifact: HTTP %s"
                             response-status)
@@ -518,19 +547,25 @@
          (kill-buffer (current-buffer))))
      nil t t)))
 
+(defun modelmux--open-externally (path)
+  "Open PATH with the system default application."
+  (pcase system-type
+    ('darwin (start-process "modelmux-open" nil "open" path))
+    ('windows-nt (start-process "modelmux-open" nil "cmd.exe" "/c" "start" "" path))
+    (_ (if-let* ((program (executable-find "xdg-open")))
+           (start-process "modelmux-open" nil program path)
+         (browse-url-of-file path)))))
+
 (defun modelmux-task-open-externally ()
   "Open the task artifact with the system default application."
   (interactive)
-  (modelmux--download-artifact
-   (lambda (path) (start-process "modelmux-open" nil "/usr/bin/open" path))))
+  (modelmux--download-artifact #'modelmux--open-externally))
 
 (defun modelmux-task-open-directory ()
-  "Open the task artifact's directory in Finder."
+  "Open the directory holding the task artifact."
   (interactive)
   (modelmux--download-artifact
-   (lambda (path)
-     (start-process "modelmux-open-directory" nil "/usr/bin/open"
-                    (file-name-directory path)))))
+   (lambda (path) (modelmux--open-externally (file-name-directory path)))))
 
 (defun modelmux-task-rename ()
   "Rename the task at point without renaming its artifact."
@@ -546,16 +581,15 @@
 (defun modelmux-task-delete ()
   "Delete marked tasks, or the task at point, through ModelMux."
   (interactive)
-  (let ((ids (modelmux--selected-task-ids)))
+  (let* ((ids (modelmux--selected-task-ids))
+         (count (length ids))
+         (plural (if (= count 1) "" "s")))
     (when (yes-or-no-p (format "Delete %d run%s and managed artifact%s? "
-                               (length ids)
-                               (if (= (length ids) 1) "" "s")
-                               (if (= (length ids) 1) "" "s")))
+                               count plural plural))
       (modelmux--http-json-sync "POST" "/v1/jobs/delete" `((ids . ,ids)))
       (clrhash modelmux--marked)
       (modelmux-tasks-refresh)
-      (message "Deleted %d run%s" (length ids)
-               (if (= (length ids) 1) "" "s")))))
+      (message "Deleted %d run%s" count plural))))
 
 (defun modelmux-task-cancel ()
   "Cancel marked tasks, or the task at point, through ModelMux."
@@ -565,19 +599,18 @@
     (modelmux-tasks-refresh)
     (message "Cancellation requested")))
 
+;;;###autoload
 (defun modelmux-stop ()
   "Cancel the first active ModelMux run."
   (interactive)
   (let* ((tasks (modelmux--http-json-sync "GET" "/v1/jobs"))
-         (task (seq-find (lambda (item)
-                           (member (alist-get 'status item) '("queued" "running")))
-                         tasks)))
+         (task (seq-find #'modelmux--task-active-p tasks)))
     (if task
         (progn
           (modelmux--http-json-sync
            "POST" (format "/v1/jobs/%s/cancel" (alist-get 'id task))
            (make-hash-table :test 'equal))
-          (modelmux--schedule-visible-refresh)
+          (modelmux--refresh-if-visible)
           (message "Cancellation requested"))
       (message "No ModelMux task is active"))))
 
@@ -585,24 +618,23 @@
   "Stop refresh activity associated with the current task-list buffer."
   (when (timerp modelmux--refresh-timer)
     (cancel-timer modelmux--refresh-timer))
-  (setq modelmux--refresh-timer nil)
-  (when (buffer-live-p modelmux--refresh-request)
-    (kill-buffer modelmux--refresh-request))
-  (setq modelmux--refresh-request nil))
+  (setq modelmux--refresh-timer nil
+        modelmux--refresh-in-flight nil))
 
-(defvar modelmux-tasks-mode-map (make-sparse-keymap)
+(defvar modelmux-tasks-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'modelmux-task-open-externally)
+    (define-key map (kbd "o") #'modelmux-task-open-externally)
+    (define-key map (kbd "O") #'modelmux-task-open-directory)
+    (define-key map (kbd "k") #'modelmux-task-cancel)
+    (define-key map (kbd "e") #'modelmux-task-rename)
+    (define-key map (kbd "D") #'modelmux-task-delete)
+    (define-key map (kbd "m") #'modelmux-task-mark)
+    (define-key map (kbd "u") #'modelmux-task-unmark)
+    (define-key map (kbd "U") #'modelmux-tasks-unmark-all)
+    (define-key map (kbd "g") #'modelmux-tasks-refresh)
+    map)
   "Keymap for `modelmux-tasks-mode'.")
-(set-keymap-parent modelmux-tasks-mode-map tabulated-list-mode-map)
-(define-key modelmux-tasks-mode-map (kbd "RET") #'modelmux-task-open-externally)
-(define-key modelmux-tasks-mode-map (kbd "o") #'modelmux-task-open-externally)
-(define-key modelmux-tasks-mode-map (kbd "O") #'modelmux-task-open-directory)
-(define-key modelmux-tasks-mode-map (kbd "k") #'modelmux-task-cancel)
-(define-key modelmux-tasks-mode-map (kbd "e") #'modelmux-task-rename)
-(define-key modelmux-tasks-mode-map (kbd "D") #'modelmux-task-delete)
-(define-key modelmux-tasks-mode-map (kbd "m") #'modelmux-task-mark)
-(define-key modelmux-tasks-mode-map (kbd "u") #'modelmux-task-unmark)
-(define-key modelmux-tasks-mode-map (kbd "U") #'modelmux-tasks-unmark-all)
-(define-key modelmux-tasks-mode-map (kbd "g") #'modelmux-tasks-refresh)
 
 (define-derived-mode modelmux-tasks-mode tabulated-list-mode "ModelMux Tasks"
   "Major mode for viewing and managing persistent ModelMux runs."
@@ -617,10 +649,11 @@
   (setq tabulated-list-entries #'modelmux--task-entries)
   (setq-local modelmux--marked (make-hash-table :test 'equal))
   (tabulated-list-init-header)
+  (modelmux--stop-refresh-timer)
   (setq-local modelmux--refresh-timer
               (run-at-time modelmux-tasks-refresh-interval
                            modelmux-tasks-refresh-interval
-                           #'modelmux--timer-refresh (current-buffer)))
+                           #'modelmux--refresh-if-visible (current-buffer)))
   (add-hook 'kill-buffer-hook #'modelmux--stop-refresh-timer nil t))
 
 (provide 'modelmux)

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
-import sys
 from pathlib import Path
 
-
-def emit_stderr(kind: str, **data: object) -> None:
-    print(json.dumps({"type": kind, **data}, ensure_ascii=False), file=sys.stderr, flush=True)
+if __package__:
+    from modelmux.workers import protocol
+else:  # Launched by an isolated runtime as a bare script path.
+    import protocol
 
 
 def parser() -> argparse.ArgumentParser:
@@ -81,7 +80,7 @@ def crossfade_join(parts: list[object], sample_rate: int, fade_ms: int):
     return joined * (0.98 / peak) if peak > 0.98 else joined
 
 
-def synthesize(arguments, *, model=None, report=emit_stderr) -> None:
+def synthesize(arguments, *, model=None, report=protocol.emit_stderr) -> None:
     model_path = Path(arguments.model).expanduser().resolve()
     reference_audio = Path(arguments.reference_audio).expanduser().resolve()
     input_path = Path(arguments.input).expanduser().resolve()
@@ -159,39 +158,26 @@ def synthesize(arguments, *, model=None, report=emit_stderr) -> None:
     report("progress", progress=100, phase="write", message="Audio ready")
 
 
-def serve(arguments) -> None:
-    from mlx_audio.tts.utils import load_model
-
-    model_path = Path(arguments.model).expanduser().resolve()
+def load(model: str):
+    """Load the Qwen3-TTS model from a concrete local directory."""
+    model_path = Path(model).expanduser().resolve()
     if not model_path.is_dir():
         raise SystemExit(f"Model is missing: {model_path}")
-    model = load_model(str(model_path))
+    from mlx_audio.tts.utils import load_model
 
-    def protocol(kind: str, **data: object) -> None:
-        print(json.dumps({"type": kind, **data}, ensure_ascii=False), flush=True)
-
-    protocol("ready")
-    for line in sys.stdin:
-        try:
-            request = json.loads(line)
-            if request.get("type") == "shutdown":
-                return
-            if request.get("type") != "run":
-                raise ValueError("unknown request type")
-            values = vars(arguments).copy()
-            values.update(request.get("parameters", {}))
-            values["input"] = request["input_path"]
-            values["output"] = request["output_path"]
-            synthesize(argparse.Namespace(**values), model=model, report=protocol)
-            protocol("result")
-        except Exception as error:
-            protocol("error", message=str(error))
+    return load_model(str(model_path))
 
 
 def main() -> None:
     arguments = parser().parse_args()
     if arguments.serve:
-        serve(arguments)
+        model = load(arguments.model)
+        # A resident worker reports progress on stdout, alongside its replies; the
+        # one-shot command reports on stderr, where `command.events: jsonl` reads it.
+        protocol.serve(
+            arguments,
+            lambda request: synthesize(request, model=model, report=protocol.emit_stdout),
+        )
         return
     if not arguments.input or not arguments.output:
         raise SystemExit("--input and --output are required")

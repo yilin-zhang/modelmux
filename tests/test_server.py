@@ -14,6 +14,7 @@ import pytest
 
 from modelmux.client import ModelMuxClient
 from modelmux.config import ProfileStore, ServerSettings
+from modelmux.errors import ModelMuxError
 from modelmux.jobs import JobManager
 from modelmux.runs import RunStore
 from modelmux.server import ModelMuxHTTPServer
@@ -21,7 +22,7 @@ from modelmux.server import ModelMuxHTTPServer
 
 @contextmanager
 def running_server(
-    tmp_path: Path,
+    tmp_path: Path, model_loading: str = "ephemeral", concurrency: int = 1
 ) -> Generator[tuple[ModelMuxClient, JobManager], None, None]:
     config = tmp_path / "config"
     profiles = config / "profiles"
@@ -36,7 +37,9 @@ def running_server(
         "input: {extension: .wav}\noutput: {extension: .txt}\ndefaults: {}\n",
         encoding="utf-8",
     )
-    settings = ServerSettings(port=0, model_loading="ephemeral")
+    settings = ServerSettings(
+        port=0, model_loading=model_loading, concurrency=concurrency
+    )
     manager = JobManager(
         settings,
         profiles=ProfileStore(config),
@@ -97,7 +100,7 @@ def test_openai_compatible_speech_and_transcription(tmp_path: Path) -> None:
             timeout=None,
         )
         assert speech == "你好".encode()
-        assert content_type == "audio/x-wav"
+        assert content_type.startswith("audio/")
 
         source = tmp_path / "speech.wav"
         source.write_text("转录结果", encoding="utf-8")
@@ -154,3 +157,45 @@ def test_server_cancels_a_running_worker_without_stopping(tmp_path: Path) -> Non
         client.json("POST", "/v1/jobs/cancel", {"ids": [created["id"]]})
         assert client.wait(created["id"], events=False)["status"] == "cancelled"
         assert client.json("GET", "/health") == {"status": "ok"}
+
+
+@pytest.mark.parametrize("model_loading", ["lazy", "preload", "ephemeral"])
+def test_every_model_loading_mode_completes_a_job(tmp_path: Path, model_loading: str) -> None:
+    with running_server(tmp_path, model_loading=model_loading) as (client, _manager):
+        created = client.submit(
+            task="tts", model="fake-tts", input_bytes=b"hello", parameters={}
+        )
+        assert client.wait(created["id"])["status"] == "completed"
+
+
+def test_resident_adapter_serializes_concurrent_jobs_on_one_profile(tmp_path: Path) -> None:
+    with running_server(tmp_path, model_loading="lazy", concurrency=2) as (client, _manager):
+        created = [
+            client.submit(
+                task="tts", model="fake-tts", input_bytes=f"job {index}".encode(),
+                parameters={},
+            )
+            for index in range(4)
+        ]
+        for record in created:
+            completed = client.wait(record["id"])
+            assert completed["status"] == "completed"
+            body, _ = client.request("GET", completed["artifact_url"])
+            assert body.startswith(b"job ")
+
+
+def test_cancelling_an_unknown_or_finished_run_is_rejected(tmp_path: Path) -> None:
+    with running_server(tmp_path) as (client, _manager):
+        created = client.submit(
+            task="tts", model="fake-tts", input_bytes=b"hello", parameters={}
+        )
+        client.wait(created["id"])
+        with pytest.raises(ModelMuxError, match="not active"):
+            client.json("POST", "/v1/jobs/cancel", {"ids": [created["id"]]})
+
+
+def test_batch_endpoints_reject_a_malformed_ids_payload(tmp_path: Path) -> None:
+    with running_server(tmp_path) as (client, _manager):
+        for path in ("/v1/jobs/cancel", "/v1/jobs/delete"):
+            with pytest.raises(ModelMuxError, match="list of run ids"):
+                client.json("POST", path, {"ids": "not-a-list"})

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,12 +13,13 @@ from modelmux.config import Profile, ProfileStore, ServerSettings
 from modelmux.errors import ModelMuxError
 from modelmux.events import null_sink
 from modelmux.runs import ACTIVE_STATUSES, FINAL_STATUSES, RunStore
-from modelmux.runtime import execute_created_run
+from modelmux.runtime import execute_created_run, stage_input
 
 
 @dataclass
 class JobControl:
     cancelled: threading.Event
+    finished: threading.Event = field(default_factory=threading.Event)
     future: Future[None] | None = None
 
 
@@ -135,15 +136,9 @@ class JobManager:
             output_path=output_path,
         )
         run_id = str(record["id"])
-        input_path = self.runs.input_path(run_id, profile.input_extension)
-        try:
-            stage(input_path)
-            input_path.chmod(0o600)
-        except BaseException:
-            input_path.unlink(missing_ok=True)
-            self.runs.finish(run_id, "failed", message="Failed to stage input")
-            active_lock.close()
-            raise
+        input_path = stage_input(
+            self.runs, run_id, profile.input_extension, active_lock, stage
+        )
         control = JobControl(threading.Event())
         with self._lock:
             if self._stopping:
@@ -187,7 +182,7 @@ class JobManager:
                 self.runs.finish(str(record["id"]), "cancelled", message="Cancelled")
                 return
             adapter, adapter_lock = self._adapter_for(profile)
-            if adapter_lock is None:
+            with adapter_lock or nullcontext():
                 execution_started = True
                 execute_created_run(
                     store=self.runs,
@@ -201,21 +196,6 @@ class JobManager:
                     cancelled=control.cancelled,
                     adapter=adapter,
                 )
-            else:
-                with adapter_lock:
-                    execution_started = True
-                    execute_created_run(
-                        store=self.runs,
-                        record=record,
-                        active_lock=active_lock,
-                        task=profile.task,
-                        profile=profile,
-                        input_path=input_path,
-                        parameters=parameters,
-                        emit=null_sink,
-                        cancelled=control.cancelled,
-                        adapter=adapter,
-                    )
         except KeyboardInterrupt:
             if not execution_started:
                 self.runs.finish(str(record["id"]), "cancelled", message="Cancelled")
@@ -232,6 +212,7 @@ class JobManager:
                 adapter.close()
             with self._lock:
                 self._controls.pop(str(record["id"]), None)
+            control.finished.set()
 
     def cancel(self, run_id: str) -> dict[str, Any]:
         return self.cancel_many([run_id])[0]
@@ -252,14 +233,15 @@ class JobManager:
         return [self.runs.update(run_id, message="Cancelling") for run_id in run_ids]
 
     def wait(self, run_id: str, timeout: float | None = None) -> dict[str, Any]:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            record = self.runs.get(run_id, reconcile=False)
-            if record.get("status") in FINAL_STATUSES:
-                return record
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(run_id)
-            time.sleep(0.05)
+        """Block until a run this server owns reaches a final status."""
+        with self._lock:
+            control = self._controls.get(run_id)
+        record = self.runs.get(run_id, reconcile=False)
+        if control is None or record.get("status") in FINAL_STATUSES:
+            return record
+        if not control.finished.wait(timeout):
+            raise TimeoutError(run_id)
+        return self.runs.get(run_id, reconcile=False)
 
     def shutdown(self) -> None:
         with self._lock:

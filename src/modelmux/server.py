@@ -20,10 +20,10 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import urlopen
 
-from modelmux.config import ProfileStore, ServerSettings, cache_home
+from modelmux.config import ServerSettings, cache_home
 from modelmux.errors import ModelMuxError
 from modelmux.jobs import JobManager
-from modelmux.runs import ACTIVE_STATUSES, FINAL_STATUSES
+from modelmux.runs import FINAL_STATUSES
 
 
 MAX_REQUEST_BYTES = 256 * 1024 * 1024
@@ -70,6 +70,14 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if body:
             self.wfile.write(body)
+
+    def _send_artifact(self, path: Path, profile: str | None = None) -> None:
+        """Send an artifact using its profile's media type, or one guessed from its name."""
+        try:
+            content_type = self.app.manager.profiles.get(str(profile)).media_type
+        except ModelMuxError:
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self._send_file(path, content_type)
 
     def _send_file(self, path: Path, content_type: str) -> None:
         """Send PATH without loading the complete artifact into memory."""
@@ -157,6 +165,13 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
                 result[str(name)] = payload
         return result
 
+    def _run_ids(self) -> list[str]:
+        """Read and validate the ``ids`` array of a batch request."""
+        ids = self._json_body().get("ids")
+        if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+            raise ModelMuxError("ids must be a list of run ids")
+        return ids
+
     def _job_id(self, suffix: str = "") -> str | None:
         prefix = "/v1/jobs/"
         if not self.path.startswith(prefix):
@@ -189,8 +204,7 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
                 if record.get("status") != "completed" or not artifact.is_file():
                     self._error(HTTPStatus.CONFLICT, "Artifact is not ready")
                     return
-                media_type = mimetypes.guess_type(artifact.name)[0] or "application/octet-stream"
-                self._send_file(artifact, media_type)
+                self._send_artifact(artifact, record.get("profile"))
             elif (run_id := self._job_id("/events")) is not None:
                 self._events(run_id)
             elif (run_id := self._job_id()) is not None:
@@ -235,17 +249,13 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
             elif urlsplit(self.path).path == "/v1/jobs/upload":
                 self._upload_job()
             elif self.path == "/v1/jobs/cancel":
-                ids = self._json_body().get("ids")
-                if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
-                    raise ModelMuxError("ids must be a list of run ids")
+                ids = self._run_ids()
                 self._json(
                     HTTPStatus.OK,
                     [_public_record(item) for item in self.app.manager.cancel_many(ids)],
                 )
             elif self.path == "/v1/jobs/delete":
-                ids = self._json_body().get("ids")
-                if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
-                    raise ModelMuxError("ids must be a list of run ids")
+                ids = self._run_ids()
                 self.app.manager.runs.delete_many(ids)
                 self._json(HTTPStatus.OK, {"deleted": ids})
             elif (run_id := self._job_id("/cancel")) is not None:
@@ -313,9 +323,7 @@ class ModelMuxHandler(BaseHTTPRequestHandler):
         completed = self.app.manager.wait(str(record["id"]))
         if completed["status"] != "completed":
             raise ModelMuxError(str(completed.get("error") or completed["status"]))
-        artifact = Path(str(completed["artifact"]))
-        media_type = mimetypes.guess_type(artifact.name)[0] or "application/octet-stream"
-        self._send_file(artifact, media_type)
+        self._send_artifact(Path(str(completed["artifact"])), completed.get("profile"))
 
     def _upload_job(self) -> None:
         """Stream a binary input into an asynchronous job."""

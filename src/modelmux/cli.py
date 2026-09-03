@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from modelmux import __version__
 from modelmux.client import ModelMuxClient
 from modelmux.config import ProfileStore, apply_overrides, cache_home, server_settings
@@ -163,7 +165,8 @@ def execute(arguments: argparse.Namespace) -> int:
     if arguments.command == "server":
         return _server(arguments)
     if arguments.command == "inspect":
-        print(yaml_dump(ProfileStore().get(arguments.profile).data), end="")
+        data = ProfileStore().get(arguments.profile).data
+        print(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), end="")
         return 0
     client = ModelMuxClient(server_settings())
     if arguments.command == "runs":
@@ -174,12 +177,6 @@ def execute(arguments: argparse.Namespace) -> int:
             print(f"{profile['id']}\t{profile['task']}")
         return 0
     return _run(arguments, client)
-
-
-def yaml_dump(value: dict[str, Any]) -> str:
-    import yaml
-
-    return yaml.safe_dump(value, allow_unicode=True, sort_keys=False)
 
 
 def main() -> None:

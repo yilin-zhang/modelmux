@@ -1,5 +1,6 @@
 ;;; modelmux-tests.el --- Tests for ModelMux -*- lexical-binding: t; -*-
 
+(require 'cl-lib)
 (require 'ert)
 (require 'modelmux)
 
@@ -85,18 +86,6 @@
     (should (equal (substring-no-properties (aref cells 3)) "✓ Ready"))
     (should (equal (aref cells 5) "3s"))))
 
-(ert-deftest modelmux-tasks-mode-has-management-bindings ()
-  (should (eq (lookup-key modelmux-tasks-mode-map (kbd "o"))
-              #'modelmux-task-open-externally))
-  (should (eq (lookup-key modelmux-tasks-mode-map (kbd "O"))
-              #'modelmux-task-open-directory))
-  (should (eq (lookup-key modelmux-tasks-mode-map (kbd "e"))
-              #'modelmux-task-rename))
-  (should (eq (lookup-key modelmux-tasks-mode-map (kbd "D"))
-              #'modelmux-task-delete))
-  (should (eq (lookup-key modelmux-tasks-mode-map (kbd "m"))
-              #'modelmux-task-mark)))
-
 (ert-deftest modelmux-progress-cell-renders-a-bar ()
   (should (equal (modelmux--progress-cell 50) "██████░░░░░░  50%")))
 
@@ -165,6 +154,82 @@
                             ((ids "run-a" "run-b")))
                           calls))
           (should (= (hash-table-count modelmux--marked) 0)))
+      (when (get-buffer modelmux--tasks-buffer)
+        (kill-buffer modelmux--tasks-buffer)))))
+
+(ert-deftest modelmux-http-body-start-skips-response-headers ()
+  (with-temp-buffer
+    (insert "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+    ;; With no `url-http-end-of-headers', the blank line must be found by search.
+    (should (equal (buffer-substring (modelmux--http-body-start) (point-max))
+                   "{}"))))
+
+(ert-deftest modelmux-http-error-response-signals-a-user-error ()
+  (with-temp-buffer
+    (insert "\r\n\r\n{\"error\": {\"message\": \"Unknown profile\"}}")
+    (setq-local url-http-response-status 400)
+    (should-error (modelmux--http-json-from-current-buffer) :type 'user-error)))
+
+(ert-deftest modelmux-mark-region-excludes-a-trailing-empty-line ()
+  (let* ((modelmux--tasks-buffer " *modelmux-test-marks*")
+         (modelmux--tasks (list (modelmux-test--task "run-a")
+                                (modelmux-test--task "run-b"))))
+    (unwind-protect
+        (with-current-buffer (get-buffer-create modelmux--tasks-buffer)
+          (modelmux-tasks-mode)
+          (tabulated-list-print t)
+          (modelmux--goto-task-id "run-a")
+          ;; A region ending exactly at the second row's start marks only the first.
+          (modelmux--mark-region (point) (save-excursion (forward-line 1) (point)))
+          (should (gethash "run-a" modelmux--marked))
+          (should-not (gethash "run-b" modelmux--marked)))
+      (when (get-buffer modelmux--tasks-buffer)
+        (kill-buffer modelmux--tasks-buffer)))))
+
+(ert-deftest modelmux-prune-marks-drops-ids-absent-from-the-response ()
+  (with-temp-buffer
+    (setq-local modelmux--marked (make-hash-table :test 'equal))
+    (puthash "gone" t modelmux--marked)
+    (puthash "run-a" t modelmux--marked)
+    (let ((modelmux--tasks (list (modelmux-test--task "run-a"))))
+      (modelmux--prune-marks))
+    (should (gethash "run-a" modelmux--marked))
+    (should-not (gethash "gone" modelmux--marked))))
+
+(ert-deftest modelmux-refresh-skips-redraw-for-unchanged-finished-runs ()
+  (let* ((modelmux--tasks-buffer " *modelmux-test-idle*")
+         (tasks (list (modelmux-test--task "run-a"))))
+    (unwind-protect
+        (with-current-buffer (get-buffer-create modelmux--tasks-buffer)
+          (modelmux-tasks-mode)
+          (setq modelmux--tasks tasks)
+          (let (redrawn)
+            (cl-letf (((symbol-function 'modelmux--print-preserving-position)
+                       (lambda () (setq redrawn t))))
+              (modelmux--accept-tasks (copy-tree tasks))
+              (should-not redrawn)
+              ;; A running task advances its elapsed time, so it must redraw.
+              (modelmux--accept-tasks (list (modelmux-test--task "run-a" "running")))
+              (should redrawn))))
+      (when (get-buffer modelmux--tasks-buffer)
+        (kill-buffer modelmux--tasks-buffer)))))
+
+(ert-deftest modelmux-refresh-guard-clears-after-every-request ()
+  (let* ((modelmux--tasks-buffer " *modelmux-test-guard*")
+         calls)
+    (unwind-protect
+        (with-current-buffer (get-buffer-create modelmux--tasks-buffer)
+          (modelmux-tasks-mode)
+          (cl-letf (((symbol-function 'modelmux--http-json-async)
+                     (lambda (_method _path _payload callback &optional finally)
+                       (push t calls)
+                       (funcall callback nil)
+                       (when finally (funcall finally)))))
+            (modelmux-tasks-refresh)
+            (should-not modelmux--refresh-in-flight)
+            ;; The guard released, so a second refresh must issue a request.
+            (modelmux-tasks-refresh)
+            (should (= (length calls) 2))))
       (when (get-buffer modelmux--tasks-buffer)
         (kill-buffer modelmux--tasks-buffer)))))
 

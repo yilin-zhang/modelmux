@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
+import sys
 from copy import deepcopy
 from dataclasses import dataclass
 from importlib import resources
@@ -28,15 +30,9 @@ def cache_home() -> Path:
     xdg = os.environ.get("XDG_CACHE_HOME")
     if xdg:
         return Path(xdg).expanduser() / "modelmux"
-    if sys_platform() == "darwin":
+    if sys.platform == "darwin":
         return Path.home() / "Library" / "Caches" / "modelmux"
     return Path.home() / ".cache" / "modelmux"
-
-
-def sys_platform() -> str:
-    import sys
-
-    return sys.platform
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:
@@ -87,9 +83,20 @@ class Profile:
         return value if value.startswith(".") else f".{value}"
 
     @property
+    def media_type(self) -> str:
+        """Return the declared output media type, or one guessed from the extension."""
+        declared = self.data.get("output", {}).get("media_type")
+        if declared:
+            return str(declared)
+        return mimetypes.guess_type(f"artifact{self.extension}")[0] or "application/octet-stream"
+
+    @property
     def input_extension(self) -> str:
         value = str(self.data.get("input", {}).get("extension", ".input"))
         return value if value.startswith(".") else f".{value}"
+
+
+MODEL_LOADING_MODES = {"ephemeral", "lazy", "preload"}
 
 
 @dataclass(frozen=True)
@@ -109,22 +116,23 @@ def server_settings(root: Path | None = None) -> ServerSettings:
     raw = ProfileStore(root).user_config().get("server", {})
     if not isinstance(raw, dict):
         raise ModelMuxError("config server must be a mapping")
-    host = str(raw.get("host", "127.0.0.1"))
+    defaults = ServerSettings()
+    host = str(raw.get("host", defaults.host))
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ModelMuxError("ModelMux server may only listen on localhost")
     try:
-        port = int(raw.get("port", 8765))
-        concurrency = int(raw.get("concurrency", 1))
+        port = int(raw.get("port", defaults.port))
+        concurrency = int(raw.get("concurrency", defaults.concurrency))
     except (TypeError, ValueError) as error:
         raise ModelMuxError("server port and concurrency must be integers") from error
     if not 1 <= port <= 65535:
         raise ModelMuxError("server port must be between 1 and 65535")
     if concurrency < 1:
         raise ModelMuxError("server concurrency must be at least 1")
-    loading = str(raw.get("model_loading", "lazy"))
-    if loading not in {"ephemeral", "lazy", "preload"}:
+    loading = str(raw.get("model_loading", defaults.model_loading))
+    if loading not in MODEL_LOADING_MODES:
         raise ModelMuxError("server model_loading must be ephemeral, lazy, or preload")
-    preload = raw.get("preload", [])
+    preload = raw.get("preload", list(defaults.preload))
     if not isinstance(preload, list) or not all(isinstance(item, str) for item in preload):
         raise ModelMuxError("server preload must be a list of profile names")
     return ServerSettings(host, port, concurrency, loading, tuple(preload))

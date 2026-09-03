@@ -57,10 +57,10 @@ class CommandAdapter(Adapter):
         template = self._command().get(key)
         if not isinstance(template, list) or not template:
             raise ModelMuxError(f"Profile {self.profile.name!r} requires command.{key}")
+        values = self._values(context)
         try:
             return [
-                os.path.expanduser(str(value).format_map(self._values(context)))
-                for value in template
+                os.path.expanduser(str(value).format_map(values)) for value in template
             ]
         except (KeyError, ValueError) as error:
             raise ModelMuxError(f"Invalid command template: {error}") from error
@@ -76,6 +76,11 @@ class CommandAdapter(Adapter):
             environment.update({str(key): str(value).format_map(values)
                                 for key, value in configured.items()})
         return environment
+
+    def _record_diagnostic(self, line: str) -> None:
+        """Keep the most recent worker output for failure messages."""
+        self._diagnostics.append(line.rstrip())
+        del self._diagnostics[:-100]
 
     @staticmethod
     def _check_executable(argv: list[str]) -> None:
@@ -109,8 +114,7 @@ class CommandAdapter(Adapter):
         def drain_stderr() -> None:
             assert worker.stderr is not None
             for line in worker.stderr:
-                self._diagnostics.append(line.rstrip())
-                del self._diagnostics[:-100]
+                self._record_diagnostic(line)
 
         threading.Thread(target=drain_stderr, daemon=True).start()
         assert worker.stdout is not None
@@ -118,7 +122,7 @@ class CommandAdapter(Adapter):
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
-                self._diagnostics.append(line.rstrip())
+                self._record_diagnostic(line)
                 continue
             if isinstance(payload, dict) and payload.get("type") == "ready":
                 return
@@ -211,7 +215,7 @@ class CommandAdapter(Adapter):
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
-                    self._diagnostics.append(line.rstrip())
+                    self._record_diagnostic(line)
                     continue
                 if not isinstance(payload, dict):
                     continue
