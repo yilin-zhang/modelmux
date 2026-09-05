@@ -19,6 +19,7 @@ from modelmux.events import Event
 ACTIVE_STATUSES = {"queued", "running"}
 FINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+EXTENSION_PATTERN = re.compile(r"\.[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def _now() -> str:
@@ -45,7 +46,7 @@ class RunStore:
 
     def input_path(self, run_id: str, extension: str) -> Path:
         """Return the private, temporary input path for a run."""
-        if not re.fullmatch(r"\.[A-Za-z0-9._-]+", extension):
+        if not EXTENSION_PATTERN.fullmatch(extension):
             raise ModelMuxError(f"Invalid input extension: {extension}")
         return self._run_dir(run_id) / f".input{extension}"
 
@@ -99,6 +100,8 @@ class RunStore:
         extension: str,
         output_path: Path | None,
     ) -> tuple[dict[str, Any], BinaryIO]:
+        if not EXTENSION_PATTERN.fullmatch(extension):
+            raise ModelMuxError(f"Invalid output extension: {extension}")
         self._ensure_root()
         run_id = uuid.uuid4().hex
         run_dir = self._run_dir(run_id)
@@ -221,17 +224,6 @@ class RunStore:
                 return False
         except OSError:
             return False
-
-    @contextmanager
-    def queue_slot(self) -> Generator[None, None, None]:
-        self._ensure_root()
-        with (self.root / ".queue.lock").open("a+b") as lock:
-            os.fchmod(lock.fileno(), 0o600)
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def rename(self, run_id: str, name: str) -> dict[str, Any]:
         value = name.strip()

@@ -7,8 +7,9 @@ import shutil
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -24,7 +25,8 @@ class ModelMuxClient:
     def __init__(self, settings: ServerSettings) -> None:
         self.settings = settings
 
-    def request(
+    @contextmanager
+    def _open(
         self,
         method: str,
         path: str,
@@ -32,8 +34,9 @@ class ModelMuxClient:
         body: bytes | None = None,
         content_type: str = "application/json",
         timeout: float | None = 30,
-    ) -> tuple[bytes, str]:
-        headers = {"Accept": "application/json"}
+        accept: str = "application/json",
+    ) -> Generator[Any, None, None]:
+        headers = {"Accept": accept}
         if body is not None:
             headers["Content-Type"] = content_type
         request = Request(
@@ -43,12 +46,33 @@ class ModelMuxClient:
             method=method,
         )
         try:
-            with urlopen(request, timeout=timeout) as response:
-                return response.read(), response.headers.get_content_type()
+            response = urlopen(request, timeout=timeout)
         except HTTPError as error:
             raise ModelMuxError(self._error_message(error)) from error
         except (OSError, URLError) as error:
             raise ModelMuxError(NOT_RUNNING) from error
+        try:
+            yield response
+        finally:
+            response.close()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes | None = None,
+        content_type: str = "application/json",
+        timeout: float | None = 30,
+    ) -> tuple[bytes, str]:
+        with self._open(
+            method,
+            path,
+            body=body,
+            content_type=content_type,
+            timeout=timeout,
+        ) as response:
+            return response.read(), response.headers.get_content_type()
 
     @staticmethod
     def _error_message(error: HTTPError) -> str:
@@ -111,18 +135,14 @@ class ModelMuxClient:
         """Stream an artifact to DESTINATION without holding it in memory."""
         destination = destination.expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        request = Request(
-            f"{self.settings.base_url}/v1/jobs/{run_id}/artifact",
-            headers={"Accept": "application/octet-stream"},
-            method="GET",
-        )
-        try:
-            with urlopen(request, timeout=None) as response, destination.open("wb") as output:
+        with self._open(
+            "GET",
+            f"/v1/jobs/{run_id}/artifact",
+            timeout=None,
+            accept="application/octet-stream",
+        ) as response:
+            with destination.open("wb") as output:
                 shutil.copyfileobj(response, output, 1024 * 1024)
-        except HTTPError as error:
-            raise ModelMuxError(self._error_message(error)) from error
-        except (OSError, URLError) as error:
-            raise ModelMuxError(NOT_RUNNING) from error
         return destination
 
     def transcribe(self, model: str, source: Path) -> dict[str, Any]:

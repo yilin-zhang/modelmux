@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import threading
 import time
@@ -13,6 +14,8 @@ from urllib.request import Request, urlopen
 import pytest
 
 from modelmux.client import ModelMuxClient
+from modelmux.adapters.base import Adapter, RunContext, RunResult
+from modelmux.adapters.copy import CopyAdapter
 from modelmux.config import ProfileStore, ServerSettings
 from modelmux.errors import ModelMuxError
 from modelmux.jobs import JobManager
@@ -154,21 +157,97 @@ def test_server_cancels_a_running_worker_without_stopping(tmp_path: Path) -> Non
             if record["status"] == "running":
                 break
             time.sleep(0.02)
+        else:
+            pytest.fail("worker did not start")
         client.json("POST", "/v1/jobs/cancel", {"ids": [created["id"]]})
         assert client.wait(created["id"], events=False)["status"] == "cancelled"
         assert client.json("GET", "/health") == {"status": "ok"}
 
 
-@pytest.mark.parametrize("model_loading", ["lazy", "preload", "ephemeral"])
-def test_every_model_loading_mode_completes_a_job(tmp_path: Path, model_loading: str) -> None:
-    with running_server(tmp_path, model_loading=model_loading) as (client, _manager):
-        created = client.submit(
-            task="tts", model="fake-tts", input_bytes=b"hello", parameters={}
+def test_server_cancels_a_queued_job_immediately(tmp_path: Path) -> None:
+    worker = tmp_path / "slow.py"
+    worker.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    with running_server(tmp_path, concurrency=1) as (client, manager):
+        profile_path = manager.profiles.root / "profiles" / "slow.json"
+        profile_path.write_text(
+            json.dumps({
+                "name": "slow", "task": "copy", "adapter": "command",
+                "defaults": {}, "input": {"extension": ".txt"},
+                "output": {"extension": ".txt"},
+                "command": {"argv": [sys.executable, str(worker)]},
+            }),
+            encoding="utf-8",
         )
-        assert client.wait(created["id"])["status"] == "completed"
+        first = client.submit(
+            task="copy", model="slow", input_bytes=b"first", parameters={}
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if client.json("GET", f"/v1/jobs/{first['id']}")["status"] == "running":
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("first worker did not start")
+        second = client.submit(
+            task="copy", model="slow", input_bytes=b"second", parameters={}
+        )
+
+        cancelled = client.json(
+            "POST", "/v1/jobs/cancel", {"ids": [second["id"]]}
+        )
+
+        assert cancelled[0]["status"] == "cancelled"
+        assert client.wait(second["id"], events=False)["status"] == "cancelled"
+        assert not manager.runs.input_path(second["id"], ".txt").exists()
+        client.json("POST", "/v1/jobs/cancel", {"ids": [first["id"]]})
 
 
-def test_resident_adapter_serializes_concurrent_jobs_on_one_profile(tmp_path: Path) -> None:
+@pytest.mark.parametrize("model_loading", ["lazy", "preload", "ephemeral"])
+def test_model_loading_modes_reuse_only_resident_adapters(
+    tmp_path: Path, model_loading: str, monkeypatch
+) -> None:
+    adapters: list[Adapter] = []
+
+    def make_adapter(profile):
+        adapter = CopyAdapter(profile)
+        adapters.append(adapter)
+        return adapter
+
+    monkeypatch.setattr("modelmux.jobs.load_adapter", make_adapter)
+    with running_server(tmp_path, model_loading=model_loading) as (client, _manager):
+        for _ in range(2):
+            created = client.submit(
+                task="tts", model="fake-tts", input_bytes=b"hello", parameters={}
+            )
+            assert client.wait(created["id"])["status"] == "completed"
+
+    assert len(adapters) == (2 if model_loading == "ephemeral" else 1)
+
+
+def test_resident_adapter_serializes_concurrent_jobs_on_one_profile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    class SlowCopyAdapter(Adapter):
+        def run(self, context: RunContext) -> RunResult:
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                time.sleep(0.05)
+                shutil.copyfile(context.input_path, context.output_path)
+                return RunResult(context.output_path, {})
+            finally:
+                with state_lock:
+                    active -= 1
+
+    monkeypatch.setattr(
+        "modelmux.jobs.load_adapter", lambda profile: SlowCopyAdapter(profile)
+    )
     with running_server(tmp_path, model_loading="lazy", concurrency=2) as (client, _manager):
         created = [
             client.submit(
@@ -183,8 +262,10 @@ def test_resident_adapter_serializes_concurrent_jobs_on_one_profile(tmp_path: Pa
             body, _ = client.request("GET", completed["artifact_url"])
             assert body.startswith(b"job ")
 
+    assert maximum_active == 1
 
-def test_cancelling_an_unknown_or_finished_run_is_rejected(tmp_path: Path) -> None:
+
+def test_cancelling_a_finished_run_is_rejected(tmp_path: Path) -> None:
     with running_server(tmp_path) as (client, _manager):
         created = client.submit(
             task="tts", model="fake-tts", input_bytes=b"hello", parameters={}

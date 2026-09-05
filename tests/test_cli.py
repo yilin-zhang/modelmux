@@ -1,15 +1,18 @@
 import stat
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from modelmux.cli import execute, parser
 from modelmux.adapters.command import CommandAdapter
 from modelmux.adapters.base import RunContext
+from modelmux.errors import ModelMuxError
 from modelmux.events import Event, null_sink
-from modelmux.runtime import run_profile
 
-from conftest import make_profile
+from conftest import execute_profile, make_profile
 
 
 def test_run_command_downloads_artifact_and_prints_json(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -25,7 +28,7 @@ def test_run_command_downloads_artifact_and_prints_json(tmp_path: Path, monkeypa
         def wait(self, _run_id, *, events=False):
             return {
                 "id": "abc", "status": "completed", "profile": "copy",
-                "artifact_url": "/v1/jobs/abc/artifact", "metadata": {},
+                "artifact_url": "/v1/jobs/abc/artifact",
             }
 
         def download(self, _run_id, destination):
@@ -56,14 +59,7 @@ def test_profiles_lists_builtins(capsys, monkeypatch) -> None:
 
 
 def test_managed_outputs_are_private(cache: Path, copy_profile) -> None:
-    result = run_profile(
-        task="copy",
-        profile=copy_profile,
-        input_bytes=b"private",
-        output_path=None,
-        parameters={},
-        emit=null_sink,
-    )
+    result = execute_profile(copy_profile, b"private")
     assert stat.S_IMODE(result.output_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(result.output_path.parent.stat().st_mode) == 0o700
 
@@ -82,14 +78,7 @@ def test_command_adapter_does_not_inherit_secrets(tmp_path: Path, cache: Path, m
         adapter="command",
         command={"argv": [sys.executable, str(worker), "{output_path}"]},
     )
-    result = run_profile(
-        task="test",
-        profile=profile,
-        input_bytes=b"",
-        output_path=None,
-        parameters={},
-        emit=null_sink,
-    )
+    result = execute_profile(profile, b"")
     assert result.output_path.read_text(encoding="utf-8") == "missing"
 
 
@@ -111,14 +100,7 @@ def test_command_adapter_streams_json_events(tmp_path: Path, cache: Path) -> Non
         },
     )
     events: list[Event] = []
-    run_profile(
-        task="test",
-        profile=profile,
-        input_bytes=b"",
-        output_path=None,
-        parameters={},
-        emit=events.append,
-    )
+    execute_profile(profile, b"", emit=events.append)
     assert any(event.type == "progress" and event.data["progress"] == 42 for event in events)
 
 
@@ -159,3 +141,23 @@ def test_command_adapter_reuses_persistent_worker(tmp_path: Path) -> None:
     finally:
         adapter.close()
     assert counter.read_text(encoding="utf-8") == "x"
+
+
+def test_command_adapter_times_out_while_waiting_for_ready(tmp_path: Path) -> None:
+    worker = tmp_path / "never_ready.py"
+    worker.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    profile = make_profile(
+        "never-ready",
+        adapter="command",
+        command={
+            "worker_argv": [sys.executable, str(worker)],
+            "ready_timeout": 0.1,
+        },
+    )
+    adapter = CommandAdapter(profile)
+    started = time.monotonic()
+
+    with pytest.raises(ModelMuxError, match="did not become ready"):
+        adapter.load()
+
+    assert time.monotonic() - started < 2

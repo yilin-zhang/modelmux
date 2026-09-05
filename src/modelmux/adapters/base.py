@@ -34,7 +34,7 @@ class Adapter(ABC):
     def __init__(self, profile: Profile) -> None:
         self.profile = profile
 
-    def load(self) -> None:
+    def load(self, cancelled: threading.Event | None = None) -> None:
         """Load reusable resources, if this adapter supports residency."""
 
     def close(self) -> None:

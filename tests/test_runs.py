@@ -5,19 +5,16 @@ import pytest
 
 from modelmux.cli import execute, parser
 from modelmux.errors import ModelMuxError
-from modelmux.events import null_sink
-from modelmux.runtime import run_profile
 from modelmux.runs import RunStore
+
+from conftest import execute_profile
 
 
 def test_managed_run_is_persistent_and_self_contained(cache: Path, copy_profile) -> None:
-    result = run_profile(
-        task="copy",
-        profile=copy_profile,
-        input_bytes=b"private article text",
-        output_path=None,
+    result = execute_profile(
+        copy_profile,
+        b"private article text",
         parameters={"secret": "not metadata"},
-        emit=null_sink,
     )
 
     assert result.run_id is not None
@@ -36,12 +33,9 @@ def test_closed_event_consumer_does_not_fail_completed_work(cache: Path, copy_pr
     def closed_consumer(_event) -> None:
         raise BrokenPipeError
 
-    result = run_profile(
-        task="copy",
-        profile=copy_profile,
-        input_bytes=b"value",
-        output_path=None,
-        parameters={},
+    result = execute_profile(
+        copy_profile,
+        b"value",
         emit=closed_consumer,
     )
 
@@ -61,6 +55,17 @@ def test_rename_changes_only_display_name(tmp_path: Path) -> None:
 
     assert renamed["name"] == "Article title"
     assert renamed["artifact"] == artifact
+
+
+def test_create_rejects_an_output_extension_that_escapes_the_run(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+
+    with pytest.raises(ModelMuxError, match="Invalid output extension"):
+        store.create(
+            task="tts", profile="voice", extension=".wav/../../outside", output_path=None
+        )
+
+    assert not (tmp_path / "outside").exists()
 
 
 def test_abandoned_active_run_becomes_interrupted(tmp_path: Path) -> None:
@@ -127,14 +132,7 @@ def test_delete_preserves_explicit_output(tmp_path: Path) -> None:
 
 
 def test_runs_cli_lists_renames_and_deletes(cache: Path, copy_profile, monkeypatch, capsys) -> None:
-    result = run_profile(
-        task="copy",
-        profile=copy_profile,
-        input_bytes=b"value",
-        output_path=None,
-        parameters={},
-        emit=null_sink,
-    )
+    result = execute_profile(copy_profile, b"value")
     assert result.run_id is not None
 
     store = RunStore()
@@ -144,10 +142,12 @@ def test_runs_cli_lists_renames_and_deletes(cache: Path, copy_profile, monkeypat
             if path == "/v1/jobs":
                 return store.list()
             if path == "/v1/jobs/delete":
+                assert isinstance(payload, dict)
                 store.delete_many(payload["ids"])
                 return {"deleted": payload["ids"]}
             run_id = path.split("/")[3]
             if method == "PATCH":
+                assert isinstance(payload, dict)
                 return store.rename(run_id, payload["name"])
             return store.get(run_id)
 

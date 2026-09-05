@@ -110,7 +110,6 @@ def _run(arguments: argparse.Namespace, client: ModelMuxClient) -> int:
         "task": arguments.task,
         "profile": completed["profile"],
         "output": output,
-        "metadata": completed.get("metadata", {}),
     }
     print(json.dumps(payload, ensure_ascii=False) if arguments.json else output)
     return 0

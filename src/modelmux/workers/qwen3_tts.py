@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 if __package__:
     from modelmux.workers import protocol
@@ -65,28 +67,42 @@ def sections(text: str, maximum: int) -> list[str]:
 def crossfade_join(parts: list[object], sample_rate: int, fade_ms: int):
     import numpy as np
 
-    joined = np.asarray(parts[0], dtype=np.float32).reshape(-1)
+    arrays = [np.asarray(part, dtype=np.float32).reshape(-1) for part in parts]
     fade_samples = round(sample_rate * fade_ms / 1000)
-    for raw_part in parts[1:]:
-        part = np.asarray(raw_part, dtype=np.float32).reshape(-1)
-        count = min(fade_samples, len(joined), len(part))
-        if count == 0:
-            joined = np.concatenate([joined, part])
-            continue
+    overlaps: list[int] = []
+    total = len(arrays[0])
+    for part in arrays[1:]:
+        count = min(fade_samples, total, len(part))
+        overlaps.append(count)
+        total += len(part) - count
+
+    joined = np.empty(total, dtype=np.float32)
+    cursor = len(arrays[0])
+    joined[:cursor] = arrays[0]
+    for part, count in zip(arrays[1:], overlaps, strict=True):
         theta = np.linspace(0.0, np.pi / 2, count, endpoint=True, dtype=np.float32)
-        overlap = joined[-count:] * np.cos(theta) + part[:count] * np.sin(theta)
-        joined = np.concatenate([joined[:-count], overlap, part[count:]])
+        if count:
+            joined[cursor - count:cursor] = (
+                joined[cursor - count:cursor] * np.cos(theta)
+                + part[:count] * np.sin(theta)
+            )
+        remainder = part[count:]
+        joined[cursor:cursor + len(remainder)] = remainder
+        cursor += len(remainder)
     peak = float(np.max(np.abs(joined))) if joined.size else 0.0
     return joined * (0.98 / peak) if peak > 0.98 else joined
 
 
-def synthesize(arguments, *, model=None, report=protocol.emit_stderr) -> None:
-    model_path = Path(arguments.model).expanduser().resolve()
+def synthesize(
+    arguments: argparse.Namespace,
+    *,
+    model: Any | None = None,
+    report: Callable[..., None] = protocol.emit_stderr,
+) -> None:
     reference_audio = Path(arguments.reference_audio).expanduser().resolve()
     input_path = Path(arguments.input).expanduser().resolve()
     output_path = Path(arguments.output).expanduser().resolve()
     for label, path, kind in (
-        ("Model", model_path, "directory"),
         ("Reference audio", reference_audio, "file"),
         ("Text input", input_path, "file"),
     ):
@@ -102,11 +118,10 @@ def synthesize(arguments, *, model=None, report=protocol.emit_stderr) -> None:
     import mlx.core as mx
     import numpy as np
     import soundfile as sf
-    from mlx_audio.tts.utils import load_model
-
     if model is None:
         report("progress", progress=2, phase="load", message="Loading Qwen3-TTS…")
-        model = load_model(str(model_path))
+        model = load(arguments.model)
+    assert model is not None
     mx.random.seed(arguments.seed)
     rendered: list[object] = []
     sample_rate: int | None = None
@@ -158,14 +173,14 @@ def synthesize(arguments, *, model=None, report=protocol.emit_stderr) -> None:
     report("progress", progress=100, phase="write", message="Audio ready")
 
 
-def load(model: str):
+def load(model: str) -> Any:
     """Load the Qwen3-TTS model from a concrete local directory."""
     model_path = Path(model).expanduser().resolve()
     if not model_path.is_dir():
         raise SystemExit(f"Model is missing: {model_path}")
     from mlx_audio.tts.utils import load_model
 
-    return load_model(str(model_path))
+    return load_model(model_path)
 
 
 def main() -> None:

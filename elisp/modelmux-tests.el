@@ -33,21 +33,27 @@
 (ert-deftest modelmux-speak-submits-selected-text ()
   (with-temp-buffer
     (insert "text to speak")
-    (let (started)
+    (let (started tasks-shown)
       (cl-letf (((symbol-function 'modelmux--submit-text-run)
-                 (lambda (&rest arguments) (setq started arguments))))
+                 (lambda (&rest arguments) (setq started arguments)))
+                ((symbol-function 'modelmux-tasks)
+                 (lambda () (setq tasks-shown t))))
         (modelmux-speak))
       (should (equal started
-                     (list "tts" modelmux-tts-profile "text to speak"))))))
+                     (list "tts" modelmux-tts-profile "text to speak")))
+      (should tasks-shown))))
 
 (ert-deftest modelmux-transcribe-submits-selected-audio-file ()
-  (let (started)
+  (let (started tasks-shown)
     (cl-letf (((symbol-function 'file-regular-p) (lambda (_file) t))
               ((symbol-function 'modelmux--submit-file-run)
-               (lambda (&rest arguments) (setq started arguments))))
+               (lambda (&rest arguments) (setq started arguments)))
+              ((symbol-function 'modelmux-tasks)
+               (lambda () (setq tasks-shown t))))
       (modelmux-transcribe "/tmp/recording.wav"))
     (should (equal started
-                   (list "asr" modelmux-asr-profile "/tmp/recording.wav")))))
+                   (list "asr" modelmux-asr-profile "/tmp/recording.wav")))
+    (should tasks-shown)))
 
 (ert-deftest modelmux-transcribe-file-picker-keeps-directories-visible ()
   (let (read-arguments)
@@ -56,7 +62,8 @@
                  (setq read-arguments arguments)
                  "/tmp/recording.wav"))
               ((symbol-function 'file-regular-p) (lambda (_file) t))
-              ((symbol-function 'modelmux--submit-file-run) #'ignore))
+              ((symbol-function 'modelmux--submit-file-run) #'ignore)
+              ((symbol-function 'modelmux-tasks) #'ignore))
       (call-interactively #'modelmux-transcribe))
     (should (nth 3 read-arguments))
     (should-not (nth 5 read-arguments))))
@@ -151,11 +158,34 @@
                     ((symbol-function 'modelmux-tasks-refresh) #'ignore))
             (modelmux-task-delete))
           (should (member '("POST" "/v1/jobs/delete"
-                            ((ids "run-a" "run-b")))
+                            ((ids . ["run-a" "run-b"])))
                           calls))
           (should (= (hash-table-count modelmux--marked) 0)))
       (when (get-buffer modelmux--tasks-buffer)
         (kill-buffer modelmux--tasks-buffer)))))
+
+(ert-deftest modelmux-batch-commands-send-json-arrays ()
+  (dolist (command '(modelmux-task-delete modelmux-task-cancel))
+    (dolist (ids '(("715db159a2ca43ebaf64a7dd3995afca")
+                   ("715db159a2ca43ebaf64a7dd3995afca" "another-run")))
+      (with-temp-buffer
+        (let ((modelmux--marked (make-hash-table :test 'equal))
+              sent)
+          (cl-letf (((symbol-function 'modelmux--selected-task-ids)
+                     (lambda () ids))
+                    ((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                    ((symbol-function 'modelmux-tasks-refresh) #'ignore)
+                    ((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _)
+                       (setq sent (json-parse-string
+                                   (decode-coding-string url-request-data 'utf-8)
+                                   :object-type 'alist))
+                       (let ((response (generate-new-buffer " *modelmux-reply*")))
+                         (with-current-buffer response
+                           (insert "HTTP/1.1 200 OK\r\n\r\n{}"))
+                         response))))
+            (funcall command))
+          (should (equal (alist-get 'ids sent) (vconcat ids))))))))
 
 (ert-deftest modelmux-http-body-start-skips-response-headers ()
   (with-temp-buffer
@@ -232,5 +262,37 @@
             (should (= (length calls) 2))))
       (when (get-buffer modelmux--tasks-buffer)
         (kill-buffer modelmux--tasks-buffer)))))
+
+(ert-deftest modelmux-http-async-runs-finally-when-request-cannot-start ()
+  (let (finished)
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (&rest _arguments) (error "cannot start"))))
+      (modelmux--http-json-async
+       "GET" "/v1/jobs" nil #'ignore (lambda () (setq finished t))))
+    (should finished)))
+
+(ert-deftest modelmux-artifact-download-reuses-the-local-copy ()
+  (let* ((root (make-temp-file "modelmux-test-" t))
+         (temporary-file-directory root)
+         (modelmux--tasks-buffer " *modelmux-test-artifact*")
+         (task (modelmux-test--task "run-a"))
+         (modelmux--tasks (list task))
+         (path (expand-file-name "modelmux/run-a/artifact.wav" root))
+         opened)
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory path) t)
+          (write-region "audio" nil path nil 'silent)
+          (with-current-buffer (get-buffer-create modelmux--tasks-buffer)
+            (modelmux-tasks-mode)
+            (tabulated-list-print t)
+            (modelmux--goto-task-id "run-a")
+            (cl-letf (((symbol-function 'make-process)
+                       (lambda (&rest _) (ert-fail "unexpected download"))))
+              (modelmux--download-artifact (lambda (value) (setq opened value)))))
+          (should (equal opened path)))
+      (when (get-buffer modelmux--tasks-buffer)
+        (kill-buffer modelmux--tasks-buffer))
+      (delete-directory root t))))
 
 ;;; modelmux-tests.el ends here

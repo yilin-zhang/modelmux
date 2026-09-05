@@ -1,36 +1,16 @@
 from __future__ import annotations
 
 import fcntl
-import signal
 import threading
-from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any, BinaryIO, Generator
+from typing import Any, BinaryIO
 
-from modelmux.adapters import Adapter, RunContext, RunResult, load_adapter
+from modelmux.adapters import Adapter, RunContext, RunResult
 from modelmux.config import Profile
-from modelmux.errors import ModelMuxError
 from modelmux.events import Event, EventSink
 from modelmux.runs import RunStore
-
-
-@contextmanager
-def _cancel_on_sigterm() -> Generator[None, None, None]:
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    previous = signal.getsignal(signal.SIGTERM)
-
-    def cancel(_signum: int, _frame: object) -> None:
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, cancel)
-    try:
-        yield
-    finally:
-        signal.signal(signal.SIGTERM, previous)
 
 
 def execute_created_run(
@@ -44,8 +24,7 @@ def execute_created_run(
     parameters: dict[str, Any],
     emit: EventSink,
     cancelled: threading.Event | None = None,
-    serialize: bool = False,
-    adapter: Adapter | None = None,
+    adapter: Adapter,
 ) -> RunResult:
     """Execute a run created by ``RunStore.create`` and finalize its record."""
     run_id = str(record["id"])
@@ -72,36 +51,34 @@ def execute_created_run(
                 },
             )
         )
-        queue = store.queue_slot() if serialize else nullcontext()
-        with _cancel_on_sigterm(), queue:
-            if cancelled is not None and cancelled.is_set():
-                raise KeyboardInterrupt
-            store.update(
-                run_id,
-                status="running",
-                message=f"Loading {profile.name}…",
-                started_at=datetime.now(timezone.utc).isoformat(),
+        if cancelled is not None and cancelled.is_set():
+            raise KeyboardInterrupt
+        store.update(
+            run_id,
+            status="running",
+            message=f"Loading {profile.name}…",
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        tracked_emit(
+            Event(
+                "started",
+                {
+                    "task": task,
+                    "profile": profile.name,
+                    "message": f"Loading {profile.name}…",
+                },
             )
-            tracked_emit(
-                Event(
-                    "started",
-                    {
-                        "task": task,
-                        "profile": profile.name,
-                        "message": f"Loading {profile.name}…",
-                    },
-                )
-            )
-            context = RunContext(
-                task=task,
-                profile=profile,
-                input_path=input_path,
-                output_path=destination,
-                parameters=parameters,
-                emit=tracked_emit,
-                cancelled=cancelled,
-            )
-            result = (adapter or load_adapter(profile)).run(context)
+        )
+        context = RunContext(
+            task=task,
+            profile=profile,
+            input_path=input_path,
+            output_path=destination,
+            parameters=parameters,
+            emit=tracked_emit,
+            cancelled=cancelled,
+        )
+        result = adapter.run(context)
         if cancelled is not None and cancelled.is_set():
             raise KeyboardInterrupt
         if managed_output:
@@ -151,43 +128,3 @@ def stage_input(
         active_lock.close()
         raise
     return input_path
-
-
-def run_profile(
-    *,
-    task: str,
-    profile: Profile,
-    input_bytes: bytes,
-    output_path: Path | None,
-    parameters: dict[str, Any],
-    emit: EventSink,
-) -> RunResult:
-    if task != profile.task:
-        raise ModelMuxError(
-            f"Profile {profile.name!r} handles {profile.task!r}, not {task!r}"
-        )
-    store = RunStore()
-    record, active_lock = store.create(
-        task=task,
-        profile=profile.name,
-        extension=profile.extension,
-        output_path=output_path,
-    )
-    input_path = stage_input(
-        store,
-        str(record["id"]),
-        profile.input_extension,
-        active_lock,
-        lambda path: path.write_bytes(input_bytes),
-    )
-    return execute_created_run(
-        store=store,
-        record=record,
-        active_lock=active_lock,
-        task=task,
-        profile=profile,
-        input_path=input_path,
-        parameters=parameters,
-        emit=emit,
-        serialize=True,
-    )

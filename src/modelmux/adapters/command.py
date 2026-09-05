@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,7 @@ class CommandAdapter(Adapter):
     def __init__(self, profile) -> None:
         super().__init__(profile)
         self._worker: subprocess.Popen[str] | None = None
+        self._worker_output: queue.Queue[str | None] | None = None
         self._diagnostics: list[str] = []
 
     def _command(self) -> dict[str, Any]:
@@ -88,7 +92,7 @@ class CommandAdapter(Adapter):
         if executable.is_absolute() and not executable.is_file():
             raise ModelMuxError(f"Command does not exist: {executable}")
 
-    def load(self) -> None:
+    def load(self, cancelled: threading.Event | None = None) -> None:
         if "worker_argv" not in self._command():
             return
         if self._worker is not None and self._worker.poll() is None:
@@ -110,6 +114,8 @@ class CommandAdapter(Adapter):
             raise ModelMuxError(f"Cannot start worker {argv[0]}: {error}") from error
         self._worker = worker
         self._diagnostics = []
+        worker_output: queue.Queue[str | None] = queue.Queue()
+        self._worker_output = worker_output
 
         def drain_stderr() -> None:
             assert worker.stderr is not None
@@ -118,7 +124,40 @@ class CommandAdapter(Adapter):
 
         threading.Thread(target=drain_stderr, daemon=True).start()
         assert worker.stdout is not None
-        for line in worker.stdout:
+
+        def drain_stdout() -> None:
+            assert worker.stdout is not None
+            for line in worker.stdout:
+                worker_output.put(line)
+            worker_output.put(None)
+
+        threading.Thread(target=drain_stdout, daemon=True).start()
+        configured_timeout = self._command().get("ready_timeout", 300)
+        try:
+            timeout = float(configured_timeout)
+        except (TypeError, ValueError) as error:
+            self.close()
+            raise ModelMuxError("command.ready_timeout must be a number") from error
+        if timeout <= 0:
+            self.close()
+            raise ModelMuxError("command.ready_timeout must be positive")
+        deadline = time.monotonic() + timeout
+        while worker.poll() is None:
+            if cancelled is not None and cancelled.is_set():
+                self._terminate_worker()
+                raise KeyboardInterrupt
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate_worker()
+                raise ModelMuxError(
+                    f"Worker did not become ready within {timeout:g} seconds"
+                )
+            try:
+                line = worker_output.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+            if line is None:
+                break
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
@@ -128,14 +167,30 @@ class CommandAdapter(Adapter):
                 return
             if isinstance(payload, dict) and payload.get("type") == "error":
                 self.close()
-                raise ModelMuxError(str(payload.get("message", "Worker failed to load")))
+                raise ModelMuxError(
+                    str(payload.get("message", "Worker failed to load"))
+                )
         worker.wait()
         detail = "\n".join(self._diagnostics[-10:])
         self.close()
         raise ModelMuxError(f"Worker exited before ready: {detail or worker.returncode}")
 
+    def _terminate_worker(self) -> None:
+        """Stop the current worker immediately and clear it from the adapter."""
+        worker, self._worker = self._worker, None
+        self._worker_output = None
+        if worker is None or worker.poll() is not None:
+            return
+        worker.terminate()
+        try:
+            worker.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            worker.kill()
+            worker.wait()
+
     def close(self) -> None:
         worker, self._worker = self._worker, None
+        self._worker_output = None
         if worker is None or worker.poll() is not None:
             return
         try:
@@ -144,7 +199,8 @@ class CommandAdapter(Adapter):
             worker.stdin.flush()
             worker.wait(timeout=5)
         except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-            worker.terminate()
+            if worker.poll() is None:
+                worker.terminate()
             try:
                 worker.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -198,7 +254,9 @@ class CommandAdapter(Adapter):
 
     def _run_worker(self, context: RunContext) -> RunResult:
         worker = self._worker
+        worker_output = self._worker_output
         assert worker is not None and worker.stdin is not None and worker.stdout is not None
+        assert worker_output is not None
         context.output_path.parent.mkdir(parents=True, exist_ok=True)
         request = {
             "type": "run",
@@ -211,7 +269,10 @@ class CommandAdapter(Adapter):
             worker.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
             worker.stdin.flush()
             watcher_done = self._watch_cancellation(worker, context)
-            for line in worker.stdout:
+            while True:
+                line = worker_output.get()
+                if line is None:
+                    break
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
@@ -234,6 +295,7 @@ class CommandAdapter(Adapter):
                 watcher_done.set()
             if worker.poll() is not None:
                 self._worker = None
+                self._worker_output = None
         if context.cancelled is not None and context.cancelled.is_set():
             raise KeyboardInterrupt
         raise ModelMuxError("Worker exited without a result")
@@ -268,12 +330,13 @@ class CommandAdapter(Adapter):
     def _stream_events(
         process: subprocess.Popen[str], context: RunContext
     ) -> tuple[str, str]:
-        stdout_parts: list[str] = []
-        diagnostics: list[str] = []
+        stdout_tail: deque[str] = deque(maxlen=100)
+        diagnostics: deque[str] = deque(maxlen=100)
 
         def read_stdout() -> None:
             assert process.stdout is not None
-            stdout_parts.append(process.stdout.read())
+            for line in process.stdout:
+                stdout_tail.append(line)
 
         reader = threading.Thread(target=read_stdout, daemon=True)
         reader.start()
@@ -294,4 +357,4 @@ class CommandAdapter(Adapter):
                 diagnostics.append(value)
         process.wait()
         reader.join()
-        return "".join(stdout_parts), "\n".join(diagnostics)
+        return "".join(stdout_tail), "\n".join(diagnostics)

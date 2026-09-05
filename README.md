@@ -146,7 +146,8 @@ unloads it when switching profiles. `preload` loads the named profiles at server
 Subclass `modelmux.adapters.Adapter` and implement `run(context)`. The context contains
 the task, resolved profile, temporary input path, requested output path, merged
 parameters, an event callback, and a cancellation event. Return `RunResult` with the
-output path and metadata. Optional `load()` and `close()` hooks own resident resources.
+output path and metadata. Optional `load(cancelled)` and `close()` hooks own resident
+resources; long-running loads should observe the cancellation event.
 
 The built-in `command` adapter is useful when a model already provides a CLI. Its
 `command.argv` is always executed directly, never through a shell. Profiles may also
@@ -174,7 +175,7 @@ Commands:
 
 Speech generation does not start playback automatically. The task table uses `RET` or
 `o` to open an artifact with the system default app, `O` to open its directory,
-`e` to rename, and `k` to cancel. Mark rows with `m`, unmark with `u` or `U`, and
+`e` to rename, and `C-c C-k` to cancel. Mark rows with `m`, unmark with `u` or `U`, and
 delete the marked rows (or the current row) with `D`. `g` refreshes immediately;
 visible task buffers also refresh automatically. Emacs sends HTTP requests directly;
 the CLI is used only for starting and stopping the detached server.

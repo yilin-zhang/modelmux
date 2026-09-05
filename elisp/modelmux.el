@@ -22,7 +22,7 @@
 ;; live table of runs and their artifacts.
 ;;
 ;; In the task table, RET or `o' opens an artifact with the system default
-;; application, `O' opens its directory, `e' renames, `k' cancels, `m'/`u'/`U'
+;; application, `O' opens its directory, `e' renames, `C-c C-k' cancels, `m'/`u'/`U'
 ;; manage marks, `D' deletes the marked runs, and `g' refreshes.
 
 ;;; Code:
@@ -39,27 +39,33 @@
 
 (defcustom modelmux-command '("modelmux")
   "Command used only to control the ModelMux server lifecycle."
-  :type '(repeat string))
+  :type '(repeat string)
+  :group 'modelmux)
 
 (defcustom modelmux-base-url "http://127.0.0.1:8765"
   "Base URL of the ModelMux gateway, without a trailing slash."
-  :type 'string)
+  :type 'string
+  :group 'modelmux)
 
 (defcustom modelmux-upload-program "curl"
-  "Program used to stream file inputs to the ModelMux gateway."
-  :type 'string)
+  "Curl-compatible program used for streaming ModelMux file transfers."
+  :type 'string
+  :group 'modelmux)
 
 (defcustom modelmux-tts-profile "qwen3-tts-0.6b-base-8bit"
   "Profile used by `modelmux-speak'."
-  :type 'string)
+  :type 'string
+  :group 'modelmux)
 
 (defcustom modelmux-asr-profile "qwen3-asr-0.6b"
   "Profile used by `modelmux-transcribe'."
-  :type 'string)
+  :type 'string
+  :group 'modelmux)
 
 (defcustom modelmux-tasks-refresh-interval 1.0
   "Seconds between task refreshes while the task buffer is visible."
-  :type 'number)
+  :type 'number
+  :group 'modelmux)
 
 (defface modelmux-status-running-face
   '((t :inherit font-lock-keyword-face :weight bold))
@@ -117,22 +123,24 @@
 
 ;;;###autoload
 (defun modelmux-speak ()
-  "Generate speech for the active region or the entire current buffer."
+  "Generate speech for the active region or buffer, then show its task."
   (interactive)
   (let ((text (string-trim (modelmux--buffer-text))))
     (when (string-empty-p text)
       (user-error "There is no text to read"))
-    (modelmux--submit-text-run "tts" modelmux-tts-profile text)))
+    (modelmux--submit-text-run "tts" modelmux-tts-profile text)
+    (modelmux-tasks)))
 
 ;;;###autoload
 (defun modelmux-transcribe (audio-file)
-  "Transcribe AUDIO-FILE using `modelmux-asr-profile'."
+  "Transcribe AUDIO-FILE using `modelmux-asr-profile', then show its task."
   (interactive
    (list (read-file-name "Audio file: " nil nil t)))
   (unless (file-regular-p audio-file)
     (user-error "Not a regular audio file: %s" audio-file))
   (modelmux--submit-file-run "asr" modelmux-asr-profile
-                             (expand-file-name audio-file)))
+                             (expand-file-name audio-file))
+  (modelmux-tasks))
 
 (defun modelmux--url (path)
   "Resolve API PATH against `modelmux-base-url'."
@@ -183,19 +191,24 @@ FINALLY, when given, runs after CALLBACK on every outcome."
         (url-request-extra-headers '(("Content-Type" . "application/json")))
         (url-request-data (and payload (encode-coding-string
                                        (json-serialize payload) 'utf-8))))
-    (url-retrieve
-     (modelmux--url path)
-     (lambda (status)
-       (unwind-protect
-           (condition-case error
-               (if (plist-get status :error)
-                   (message "ModelMux server is unavailable: %s"
-                            (plist-get status :error))
-                 (funcall callback (modelmux--http-json-from-current-buffer)))
-             (error (message "%s" (error-message-string error))))
-         (when finally (funcall finally))
-         (kill-buffer (current-buffer))))
-     nil t t)))
+    (condition-case error
+        (url-retrieve
+         (modelmux--url path)
+         (lambda (status)
+           (unwind-protect
+               (condition-case callback-error
+                   (if (plist-get status :error)
+                       (message "ModelMux server is unavailable: %s"
+                                (plist-get status :error))
+                     (funcall callback (modelmux--http-json-from-current-buffer)))
+                 (error (message "%s" (error-message-string callback-error))))
+             (when finally (funcall finally))
+             (kill-buffer (current-buffer))))
+         nil t t)
+      (error
+       (when finally (funcall finally))
+       (message "ModelMux server is unavailable: %s"
+                (error-message-string error))))))
 
 (defun modelmux--server-command (action)
   "Run the configured ModelMux server ACTION and return its output."
@@ -513,39 +526,58 @@ active runs are redrawn regardless because their elapsed time advances."
   "Return marked task IDs, or the task ID at point when none are marked."
   (or (modelmux--marked-task-ids) (list (modelmux--task-id-at-point))))
 
+(defun modelmux--artifact-download-sentinel
+    (process _event temporary path callback)
+  "Finish PROCESS downloading TEMPORARY, move it to PATH, and call CALLBACK."
+  (when (memq (process-status process) '(exit signal))
+    (let ((buffer (process-buffer process)))
+      (unwind-protect
+          (if (and (zerop (process-exit-status process))
+                   (file-regular-p temporary))
+              (progn
+                (rename-file temporary path t)
+                (set-file-modes path #o600)
+                (funcall callback path))
+            (when (file-exists-p temporary) (delete-file temporary))
+            (message "Cannot download ModelMux artifact: %s"
+                     (string-trim
+                      (with-current-buffer buffer (buffer-string)))))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
 (defun modelmux--download-artifact (callback)
-  "Download the artifact at point and invoke CALLBACK with its path."
+  "Download the artifact at point and invoke CALLBACK with its local path."
   (let* ((task (or (modelmux--task-at-point) (user-error "No task at point")))
          (url (alist-get 'artifact_url task))
          (directory (expand-file-name
                      (alist-get 'id task)
                      (expand-file-name "modelmux/" temporary-file-directory)))
          (suffix (pcase (alist-get 'task task)
-                   ("tts" ".wav") ("asr" ".txt") (_ ".artifact"))))
+                   ("tts" ".wav") ("asr" ".txt") (_ ".artifact")))
+         (path (expand-file-name (concat "artifact" suffix) directory)))
     (unless (equal (alist-get 'status task) "completed")
       (user-error "This task has no completed artifact"))
     (unless url (user-error "This task has no artifact URL"))
-    (url-retrieve
-     (modelmux--url url)
-     (lambda (status)
-       (unwind-protect
-           (if (plist-get status :error)
-               (message "Cannot download ModelMux artifact: %s"
-                        (plist-get status :error))
-             (let ((response-status (or (bound-and-true-p url-http-response-status) 0)))
-               (if (>= response-status 400)
-                   (message "Cannot download ModelMux artifact: HTTP %s"
-                            response-status)
-                 (goto-char (modelmux--http-body-start))
-                 (make-directory directory t)
-                 (set-file-modes directory #o700)
-                 (let ((path (expand-file-name (concat "artifact" suffix) directory)))
-                   (let ((coding-system-for-write 'binary))
-                     (write-region (point) (point-max) path nil 'silent))
-                   (set-file-modes path #o600)
-                   (funcall callback path)))))
-         (kill-buffer (current-buffer))))
-     nil t t)))
+    (if (file-regular-p path)
+        (funcall callback path)
+      (let* ((program (or (executable-find modelmux-upload-program)
+                          (user-error "Cannot find %s" modelmux-upload-program)))
+             (buffer (generate-new-buffer " *modelmux-download*"))
+             (temporary (make-temp-name (concat path ".")))
+             (sentinel (lambda (process event)
+                         (modelmux--artifact-download-sentinel
+                          process event temporary path callback))))
+        (make-directory directory t)
+        (set-file-modes directory #o700)
+        (make-process
+         :name "modelmux-download"
+         :buffer buffer
+         :command (list program "--silent" "--show-error"
+                        "--fail-with-body" "--output" temporary
+                        (modelmux--url url))
+         :coding 'utf-8-unix
+         :noquery t
+         :sentinel sentinel)
+        (message "Downloading ModelMux artifact…")))))
 
 (defun modelmux--open-externally (path)
   "Open PATH with the system default application."
@@ -586,7 +618,7 @@ active runs are redrawn regardless because their elapsed time advances."
          (plural (if (= count 1) "" "s")))
     (when (yes-or-no-p (format "Delete %d run%s and managed artifact%s? "
                                count plural plural))
-      (modelmux--http-json-sync "POST" "/v1/jobs/delete" `((ids . ,ids)))
+      (modelmux--http-json-sync "POST" "/v1/jobs/delete" `((ids . ,(vconcat ids))))
       (clrhash modelmux--marked)
       (modelmux-tasks-refresh)
       (message "Deleted %d run%s" count plural))))
@@ -595,7 +627,7 @@ active runs are redrawn regardless because their elapsed time advances."
   "Cancel marked tasks, or the task at point, through ModelMux."
   (interactive)
   (let ((ids (modelmux--selected-task-ids)))
-    (modelmux--http-json-sync "POST" "/v1/jobs/cancel" `((ids . ,ids)))
+    (modelmux--http-json-sync "POST" "/v1/jobs/cancel" `((ids . ,(vconcat ids))))
     (modelmux-tasks-refresh)
     (message "Cancellation requested")))
 
@@ -626,7 +658,7 @@ active runs are redrawn regardless because their elapsed time advances."
     (define-key map (kbd "RET") #'modelmux-task-open-externally)
     (define-key map (kbd "o") #'modelmux-task-open-externally)
     (define-key map (kbd "O") #'modelmux-task-open-directory)
-    (define-key map (kbd "k") #'modelmux-task-cancel)
+    (define-key map (kbd "C-c C-k") #'modelmux-task-cancel)
     (define-key map (kbd "e") #'modelmux-task-rename)
     (define-key map (kbd "D") #'modelmux-task-delete)
     (define-key map (kbd "m") #'modelmux-task-mark)

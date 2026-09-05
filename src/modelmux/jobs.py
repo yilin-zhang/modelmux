@@ -6,7 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 
 from modelmux.adapters import Adapter, load_adapter
 from modelmux.config import Profile, ProfileStore, ServerSettings
@@ -19,6 +19,8 @@ from modelmux.runtime import execute_created_run, stage_input
 @dataclass
 class JobControl:
     cancelled: threading.Event
+    input_path: Path
+    active_lock: BinaryIO
     finished: threading.Event = field(default_factory=threading.Event)
     future: Future[None] | None = None
 
@@ -50,7 +52,9 @@ class JobManager:
             for name in settings.preload:
                 self._resident_adapter(self.profiles.get(name))
 
-    def _resident_adapter(self, profile: Profile) -> Adapter:
+    def _resident_adapter(
+        self, profile: Profile, cancelled: threading.Event | None = None
+    ) -> Adapter:
         with self._adapter_cache_lock:
             adapter = self._adapters.get(profile.name)
             if adapter is None:
@@ -62,13 +66,15 @@ class JobManager:
                 adapter = load_adapter(profile)
                 self._adapters[profile.name] = adapter
                 self._adapter_locks[profile.name] = threading.Lock()
-            adapter.load()
+            adapter.load(cancelled)
             return adapter
 
-    def _adapter_for(self, profile: Profile) -> tuple[Adapter, threading.Lock | None]:
+    def _adapter_for(
+        self, profile: Profile, cancelled: threading.Event | None = None
+    ) -> tuple[Adapter, threading.Lock | None]:
         if self.settings.model_loading == "ephemeral":
             return load_adapter(profile), None
-        adapter = self._resident_adapter(profile)
+        adapter = self._resident_adapter(profile, cancelled)
         return adapter, self._adapter_locks[profile.name]
 
     def submit(
@@ -139,7 +145,7 @@ class JobManager:
         input_path = stage_input(
             self.runs, run_id, profile.input_extension, active_lock, stage
         )
-        control = JobControl(threading.Event())
+        control = JobControl(threading.Event(), input_path, active_lock)
         with self._lock:
             if self._stopping:
                 input_path.unlink(missing_ok=True)
@@ -181,7 +187,7 @@ class JobManager:
             if control.cancelled.is_set():
                 self.runs.finish(str(record["id"]), "cancelled", message="Cancelled")
                 return
-            adapter, adapter_lock = self._adapter_for(profile)
+            adapter, adapter_lock = self._adapter_for(profile, control.cancelled)
             with adapter_lock or nullcontext():
                 execution_started = True
                 execute_created_run(
@@ -218,7 +224,7 @@ class JobManager:
         return self.cancel_many([run_id])[0]
 
     def cancel_many(self, run_ids: list[str]) -> list[dict[str, Any]]:
-        controls: list[JobControl] = []
+        controls: list[tuple[str, JobControl]] = []
         with self._lock:
             for run_id in run_ids:
                 record = self.runs.get(run_id)
@@ -227,10 +233,21 @@ class JobManager:
                 control = self._controls.get(run_id)
                 if control is None:
                     raise ModelMuxError(f"Run {run_id} is not owned by this server")
-                controls.append(control)
-        for control in controls:
+                controls.append((run_id, control))
+        results: list[dict[str, Any]] = []
+        for run_id, control in controls:
             control.cancelled.set()
-        return [self.runs.update(run_id, message="Cancelling") for run_id in run_ids]
+            if control.future is not None and control.future.cancel():
+                control.input_path.unlink(missing_ok=True)
+                result = self.runs.finish(run_id, "cancelled", message="Cancelled")
+                control.active_lock.close()
+                with self._lock:
+                    self._controls.pop(run_id, None)
+                control.finished.set()
+            else:
+                result = self.runs.update(run_id, message="Cancelling")
+            results.append(result)
+        return results
 
     def wait(self, run_id: str, timeout: float | None = None) -> dict[str, Any]:
         """Block until a run this server owns reaches a final status."""
