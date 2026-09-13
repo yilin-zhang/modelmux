@@ -55,6 +55,33 @@
                    (list "asr" modelmux-asr-profile "/tmp/recording.wav")))
     (should tasks-shown)))
 
+(ert-deftest modelmux-music-submits-lyrics-and-style ()
+  (with-temp-buffer
+    (insert "[Verse]\n晚风吹过窗边")
+    (let (started tasks-shown)
+      (cl-letf (((symbol-function 'modelmux--submit-text-run)
+                 (lambda (&rest arguments) (setq started arguments)))
+                ((symbol-function 'modelmux-tasks)
+                 (lambda () (setq tasks-shown t))))
+        (modelmux-music "Mandarin, folk"))
+      (should (equal started (list "music" modelmux-music-profile
+                                   "[Verse]\n晚风吹过窗边"
+                                   '((style . "Mandarin, folk")))))
+      (should tasks-shown))))
+
+(ert-deftest modelmux-music-rejects-empty-input ()
+  (with-temp-buffer
+    (should-error (modelmux-music "folk") :type 'user-error)
+    (insert "lyrics")
+    (should-error (modelmux-music " ") :type 'user-error)))
+
+(ert-deftest modelmux-text-run-includes-parameter-overrides ()
+  (let (request)
+    (cl-letf (((symbol-function 'modelmux--http-json-async)
+               (lambda (_method _path payload _callback) (setq request payload))))
+      (modelmux--submit-text-run "music" "yue" "lyrics" '((style . "folk"))))
+    (should (equal (alist-get 'parameters request) '((style . "folk"))))))
+
 (ert-deftest modelmux-transcribe-file-picker-keeps-directories-visible ()
   (let (read-arguments)
     (cl-letf (((symbol-function 'read-file-name)

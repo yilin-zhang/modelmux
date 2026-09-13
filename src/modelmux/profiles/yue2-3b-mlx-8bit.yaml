@@ -1,0 +1,61 @@
+name: yue2-3b-mlx-8bit
+task: music
+adapter: command
+description: YuE2 music generation, community MLX 8-bit (noncommercial).
+model: ahmadw/YuE2-3B-MLX
+input:
+  kind: text
+  extension: .txt
+output:
+  kind: audio
+  extension: .wav
+  media_type: audio/wav
+defaults:
+  runtime_python: python3
+  source_path: ~/Library/Caches/modelmux/models/yue2-3b-mlx
+  model_path: ~/Library/Caches/modelmux/models/yue2-3b-mlx/8bit
+  style: Mandarin, acoustic pop, warm clear vocals
+  cot: full
+  seed: 831001
+  max_semantic_tokens: 750
+  steps: 32
+  cfg_scale: null
+  vae_core_frames: 128
+capabilities:
+  streaming: false
+  languages: [zh, en]
+command:
+  events: jsonl
+  worker_argv:
+    - "{runtime_python}"
+    - "{package_root}/workers/yue2_mlx.py"
+    - --serve
+    - --model
+    - "{model_path}"
+    - --source
+    - "{source_path}"
+  argv:
+    - "{runtime_python}"
+    - "{package_root}/workers/yue2_mlx.py"
+    - --model
+    - "{model_path}"
+    - --source
+    - "{source_path}"
+    - --input
+    - "{input_path}"
+    - --output
+    - "{output_path}"
+    - --style
+    - "{style}"
+    - --cot
+    - "{cot}"
+    - --seed
+    - "{seed}"
+    - --max-semantic-tokens
+    - "{max_semantic_tokens}"
+    - --steps
+    - "{steps}"
+    - --cfg-scale
+    - "{cfg_scale}"
+    - --vae-core-frames
+    - "{vae_core_frames}"

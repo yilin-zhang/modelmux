@@ -155,6 +155,12 @@ provide `command.worker_argv` for a reusable JSON-lines worker; Qwen3 TTS and AS
 
 ## Emacs
 
+Music generation is available through the `yue2-3b-mlx-8bit` profile and
+`modelmux music` / `M-x modelmux-music`. It uses lyrics plus a style prompt,
+generates a WAV, and defaults to a 30-second cap for local experimentation.
+See [YuE2 MLX setup and measurements](runtimes/yue2-mlx/README.md) for the isolated
+runtime, pinned weight download, memory measurements, and noncommercial license.
+
 Add `elisp/` to `load-path`, require `modelmux`, and point it at this checkout while
 developing:
 

@@ -1,0 +1,10 @@
+[project]
+name = "modelmux-runtime-yue2"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "yue2-infer @ https://huggingface.co/m-a-p/YuE2-3B/resolve/main/yue2_infer-0.1.5-py3-none-any.whl",
+]
+
+[tool.uv]
+package = false

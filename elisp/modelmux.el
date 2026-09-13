@@ -18,6 +18,7 @@
 ;; Entry points: `modelmux-server-start', `modelmux-server-status' and
 ;; `modelmux-server-stop' manage the gateway; `modelmux-speak' reads the region
 ;; or buffer aloud; `modelmux-transcribe' streams an audio file for ASR;
+;; `modelmux-music' generates a song from lyrics in the region or buffer;
 ;; `modelmux-stop' cancels the first active run; and `modelmux-tasks' opens a
 ;; live table of runs and their artifacts.
 ;;
@@ -59,6 +60,16 @@
 
 (defcustom modelmux-asr-profile "qwen3-asr-0.6b"
   "Profile used by `modelmux-transcribe'."
+  :type 'string
+  :group 'modelmux)
+
+(defcustom modelmux-music-profile "yue2-3b-mlx-8bit"
+  "Profile used by `modelmux-music'."
+  :type 'string
+  :group 'modelmux)
+
+(defcustom modelmux-music-style "Mandarin, acoustic pop, warm clear vocals"
+  "Initial style prompt offered by `modelmux-music'."
   :type 'string
   :group 'modelmux)
 
@@ -141,6 +152,21 @@
   (modelmux--submit-file-run "asr" modelmux-asr-profile
                              (expand-file-name audio-file))
   (modelmux-tasks))
+
+;;;###autoload
+(defun modelmux-music (style)
+  "Generate music in STYLE from lyrics in the active region or buffer.
+Use `modelmux-music-profile' and show the submitted task.  The profile
+controls the duration cap; this command does not automatically play audio."
+  (interactive (list (read-string "Music style: " modelmux-music-style)))
+  (let ((lyrics (string-trim (modelmux--buffer-text))))
+    (when (string-empty-p lyrics)
+      (user-error "There are no lyrics to sing"))
+    (when (string-empty-p (string-trim style))
+      (user-error "Music style cannot be empty"))
+    (modelmux--submit-text-run "music" modelmux-music-profile lyrics
+                               `((style . ,style)))
+    (modelmux-tasks)))
 
 (defun modelmux--url (path)
   "Resolve API PATH against `modelmux-base-url'."
@@ -248,12 +274,13 @@ FINALLY, when given, runs after CALLBACK on every outcome."
         (when (derived-mode-p 'modelmux-tasks-mode)
           (modelmux-tasks-refresh))))))
 
-(defun modelmux--submit-text-run (task profile text)
-  "Submit TEXT to PROFILE as an asynchronous TASK."
+(defun modelmux--submit-text-run (task profile text &optional parameters)
+  "Submit TEXT to PROFILE as an asynchronous TASK.
+PARAMETERS is an optional alist of model parameter overrides."
   (modelmux--http-json-async
    "POST" "/v1/jobs"
    `((task . ,task) (model . ,profile) (input . ,text)
-     (parameters . ,(make-hash-table :test 'equal)))
+     (parameters . ,(or parameters (make-hash-table :test 'equal))))
    (lambda (job)
      (modelmux--refresh-if-visible)
      (message "ModelMux %s job %s queued" (upcase task) (alist-get 'id job)))))
@@ -552,7 +579,7 @@ active runs are redrawn regardless because their elapsed time advances."
                      (alist-get 'id task)
                      (expand-file-name "modelmux/" temporary-file-directory)))
          (suffix (pcase (alist-get 'task task)
-                   ("tts" ".wav") ("asr" ".txt") (_ ".artifact")))
+                   ((or "tts" "music") ".wav") ("asr" ".txt") (_ ".artifact")))
          (path (expand-file-name (concat "artifact" suffix) directory)))
     (unless (equal (alist-get 'status task) "completed")
       (user-error "This task has no completed artifact"))

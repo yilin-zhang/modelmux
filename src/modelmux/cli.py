@@ -16,7 +16,7 @@ from modelmux.errors import ModelMuxError
 from modelmux.server import health, serve, start_server
 
 
-TASK_ALIASES = ("tts", "asr", "ocr", "chat", "image", "embed")
+TASK_ALIASES = ("tts", "asr", "ocr", "chat", "image", "embed", "music")
 
 
 def add_run_arguments(parser: argparse.ArgumentParser, *, include_task: bool) -> None:
