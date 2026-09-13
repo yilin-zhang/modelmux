@@ -7,7 +7,7 @@ from modelmux.cli import execute, parser
 from modelmux.errors import ModelMuxError
 from modelmux.runs import RunStore
 
-from conftest import execute_profile
+from .conftest import execute_profile
 
 
 def test_managed_run_is_persistent_and_self_contained(cache: Path, copy_profile) -> None:

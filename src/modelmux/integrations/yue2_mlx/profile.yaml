@@ -28,7 +28,7 @@ command:
   events: jsonl
   worker_argv:
     - "{runtime_python}"
-    - "{package_root}/workers/yue2_mlx.py"
+    - "{package_root}/integrations/yue2_mlx/worker.py"
     - --serve
     - --model
     - "{model_path}"
@@ -36,7 +36,7 @@ command:
     - "{source_path}"
   argv:
     - "{runtime_python}"
-    - "{package_root}/workers/yue2_mlx.py"
+    - "{package_root}/integrations/yue2_mlx/worker.py"
     - --model
     - "{model_path}"
     - --source

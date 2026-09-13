@@ -45,12 +45,12 @@ Create them once, then point the corresponding user profile at the resulting
 Python executable:
 
 ```sh
-uv sync --project runtimes/qwen3-tts
-uv sync --project runtimes/qwen3-asr
+uv sync --project src/modelmux/integrations/qwen3_tts
+uv sync --project src/modelmux/integrations/qwen3_asr
 ```
 
-The executables are `runtimes/qwen3-tts/.venv/bin/python` and
-`runtimes/qwen3-asr/.venv/bin/python`. Keeping model-specific packages outside
+The executables are `src/modelmux/integrations/qwen3_tts/.venv/bin/python` and
+`src/modelmux/integrations/qwen3_asr/.venv/bin/python`. Keeping model-specific packages outside
 ModelMux's core environment avoids dependency conflicts between backends.
 
 Run the dependency-free integration profile:
@@ -143,6 +143,11 @@ unloads it when switching profiles. `preload` loads the named profiles at server
 
 ## Adapter contract
 
+Bundled models own their worker, profile, runtime dependencies and tests under
+[`src/modelmux/integrations/`](src/modelmux/integrations/README.md). Repository-level
+`tests/` covers the core glue only. Run `uv run pytest` for all normal tests,
+`uv run pytest tests` for core tests, or pass an integration's `tests/` directory.
+
 Subclass `modelmux.adapters.Adapter` and implement `run(context)`. The context contains
 the task, resolved profile, temporary input path, requested output path, merged
 parameters, an event callback, and a cancellation event. Return `RunResult` with the
@@ -158,7 +163,7 @@ provide `command.worker_argv` for a reusable JSON-lines worker; Qwen3 TTS and AS
 Music generation is available through the `yue2-3b-mlx-8bit` profile and
 `modelmux music` / `M-x modelmux-music`. It uses lyrics plus a style prompt,
 generates a WAV, and defaults to a 30-second cap for local experimentation.
-See [YuE2 MLX setup and measurements](runtimes/yue2-mlx/README.md) for the isolated
+See [YuE2 MLX setup and measurements](src/modelmux/integrations/yue2_mlx/README.md) for the isolated
 runtime, pinned weight download, memory measurements, and noncommercial license.
 
 Add `elisp/` to `load-path`, require `modelmux`, and point it at this checkout while

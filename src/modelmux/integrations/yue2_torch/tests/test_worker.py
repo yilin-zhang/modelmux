@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from modelmux.workers.yue2_torch import main
+from modelmux.integrations.yue2_torch.worker import main
 
 
 @pytest.mark.parametrize(

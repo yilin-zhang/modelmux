@@ -18,10 +18,13 @@ modelmux = "modelmux.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modelmux"]
+exclude = ["src/modelmux/integrations/*/tests/**"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-testpaths = ["tests"]
+testpaths = ["tests", "src/modelmux/integrations"]
+addopts = "--import-mode=importlib"
+markers = ["model: opt-in local model/GPU inference tests"]
 
 [dependency-groups]
 dev = [

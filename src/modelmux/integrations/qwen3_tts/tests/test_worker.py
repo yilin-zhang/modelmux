@@ -1,4 +1,4 @@
-from modelmux.workers.qwen3_tts import hard_split, sections
+from modelmux.integrations.qwen3_tts.worker import hard_split, sections
 
 
 def test_sections_keep_short_paragraphs_together() -> None:

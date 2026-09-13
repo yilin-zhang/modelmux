@@ -6,10 +6,9 @@ import pytest
 
 from modelmux.adapters.base import RunContext
 from modelmux.adapters.command import CommandAdapter
-from modelmux.cli import parser as cli_parser
 from modelmux.config import ProfileStore
 from modelmux.events import null_sink
-from modelmux.workers.yue2_mlx import Progress, parser, validate_request, verify_source
+from modelmux.integrations.yue2_mlx.worker import Progress, parser, validate_request, verify_source
 
 
 @pytest.fixture
@@ -89,4 +88,3 @@ def test_music_profile_passes_same_parameters_to_one_shot_worker(tmp_path):
     context.parameters["cfg_scale"] = None
     assert parser().parse_args(adapter._argv("argv", context)[2:]).cfg_scale is None
     assert profile.media_type == "audio/wav"
-    assert cli_parser().parse_args(["music", "lyrics.txt"]).task == "music"

@@ -12,7 +12,14 @@ from modelmux.adapters.base import RunContext
 from modelmux.errors import ModelMuxError
 from modelmux.events import Event, null_sink
 
-from conftest import execute_profile, make_profile
+from .conftest import execute_profile, make_profile
+
+
+@pytest.mark.parametrize("task", ["tts", "asr", "ocr", "chat", "image", "embed", "music"])
+def test_task_aliases_accept_an_input_file(task):
+    arguments = parser().parse_args([task, "input.txt"])
+    assert arguments.task == task
+    assert arguments.input == "input.txt"
 
 
 def test_run_command_downloads_artifact_and_prints_json(tmp_path: Path, monkeypatch, capsys) -> None:

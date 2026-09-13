@@ -152,12 +152,18 @@ class ProfileStore:
     def _builtins(self) -> dict[str, tuple[str, dict[str, Any]]]:
         result: dict[str, tuple[str, dict[str, Any]]] = {}
         directory = resources.files("modelmux").joinpath("profiles")
-        for item in directory.iterdir():
+        items = list(directory.iterdir())
+        integrations = resources.files("modelmux").joinpath("integrations")
+        items.extend(child.joinpath("profile.yaml") for child in integrations.iterdir()
+                     if child.is_dir() and child.joinpath("profile.yaml").is_file())
+        for item in items:
             if item.name.endswith((".yaml", ".yml", ".json")):
                 with resources.as_file(item) as path:
                     data = _load_mapping(path)
                 name = str(data.get("name") or Path(item.name).stem)
-                result[name] = (f"builtin:{item.name}", data)
+                if name in result:
+                    raise ModelMuxError(f"Duplicate built-in profile: {name}")
+                result[name] = (f"builtin:{name}", data)
         return result
 
     def _user_profiles(self) -> dict[str, tuple[str, dict[str, Any]]]:

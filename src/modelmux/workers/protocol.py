@@ -1,8 +1,7 @@
 """JSON-lines protocol shared by ModelMux's bundled worker scripts.
 
-Workers are launched by a foreign interpreter as bare script paths, so this
-module is imported as a plain sibling of the worker rather than through the
-``modelmux`` package.
+Integration workers import this dependency-free module even when launched by
+an isolated interpreter without the gateway's dependencies installed.
 """
 
 from __future__ import annotations

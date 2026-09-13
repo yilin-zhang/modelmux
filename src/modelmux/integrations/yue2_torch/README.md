@@ -7,8 +7,8 @@ already supports MPS. No architecture conversion or retraining is involved.
 From the repository root:
 
 ```sh
-uv sync --project runtimes/yue2 --locked
-runtimes/yue2/.venv/bin/python src/modelmux/workers/yue2_torch.py \
+uv sync --project src/modelmux/integrations/yue2_torch --locked
+src/modelmux/integrations/yue2_torch/.venv/bin/python src/modelmux/integrations/yue2_torch/worker.py \
   --model "$HOME/Library/Caches/modelmux/models/YuE2-3B" \
   --vae "$HOME/Library/Caches/modelmux/models/YuE2-Vae" \
   --input lyrics.txt --output sample.flac \
@@ -46,8 +46,9 @@ replace this runner's weights:
 - [audio-cpp/Yue2-3B-GGUF](https://huggingface.co/audio-cpp/Yue2-3B-GGUF):
   Q8/Q4 variants for audio.cpp.
 
-These sizes describe published artifacts, not peak inference RAM. Neither
-community implementation has been tested here.
+These sizes describe published artifacts, not peak inference RAM. The MLX
+implementation is now integrated and tested; see [its measurements](../yue2_mlx/README.md).
+The GGUF implementation has not been tested here.
 
-To uninstall the isolated dependencies, remove `runtimes/yue2/.venv`.
+To uninstall the isolated dependencies, remove `src/modelmux/integrations/yue2_torch/.venv`.
 This does not remove any separately downloaded model weights.

@@ -16,10 +16,9 @@ import sys
 import time
 from dataclasses import replace
 
-if __package__:
-    from modelmux.workers import protocol
-else:
-    import protocol
+if not __package__:  # Bare script in an isolated environment without modelmux installed.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from modelmux.workers import protocol
 
 
 REVISION = "fe0a9050fd658257b486b880422d8872ee1f81e3"

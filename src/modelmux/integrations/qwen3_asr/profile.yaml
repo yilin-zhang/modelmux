@@ -21,13 +21,13 @@ capabilities:
 command:
   worker_argv:
     - "{runtime_python}"
-    - "{package_root}/workers/qwen3_asr.py"
+    - "{package_root}/integrations/qwen3_asr/worker.py"
     - --serve
     - --model
     - "{model_path}"
   argv:
     - "{runtime_python}"
-    - "{package_root}/workers/qwen3_asr.py"
+    - "{package_root}/integrations/qwen3_asr/worker.py"
     - --model
     - "{model_path}"
     - --input

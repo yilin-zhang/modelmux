@@ -37,7 +37,7 @@ def main() -> None:
     if not lyrics:
         parser.error("Lyrics are empty")
 
-    # These dependencies live in runtimes/yue2, not the gateway environment.
+    # These dependencies live in src/modelmux/integrations/yue2_torch, not the gateway environment.
     import torch  # pyright: ignore[reportMissingImports]
     from yue2 import YuE2Pipeline  # pyright: ignore[reportMissingImports]
 

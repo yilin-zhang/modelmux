@@ -11,7 +11,7 @@ introduced. A worker exits when cancelled, and the next request reloads it.
 From the repository root:
 
 ```sh
-uv sync --project runtimes/yue2-mlx --locked
+uv sync --project src/modelmux/integrations/yue2_mlx --locked
 hf download ahmadw/YuE2-3B-MLX \
   generate.py yue2_model.py yue2_vae.py README.md \
   8bit/config.json 8bit/model.safetensors 8bit/vae.safetensors \
@@ -28,12 +28,12 @@ Add this entry under `profiles` in your **private**
 profiles:
   yue2-3b-mlx-8bit:
     defaults:
-      runtime_python: /absolute/path/to/modelmux/runtimes/yue2-mlx/.venv/bin/python
+      runtime_python: /absolute/path/to/modelmux/src/modelmux/integrations/yue2_mlx/.venv/bin/python
 ```
 
 Bundled YAML contains portable defaults, not a developer's checkout path. To use
 another cache location, override both `source_path` and `model_path` privately.
-Uninstall dependencies by removing `runtimes/yue2-mlx/.venv`; to reclaim weights
+Uninstall dependencies by removing `src/modelmux/integrations/yue2_mlx/.venv`; to reclaim weights
 too, remove only `~/Library/Caches/modelmux/models/yue2-3b-mlx` and its private
 profile override. Generated runs remain until manually deleted through modelmux.
 
@@ -41,7 +41,7 @@ profile override. Generated runs remain until manually deleted through modelmux.
 
 ```sh
 modelmux server start  # only if it is not already running
-modelmux music runtimes/yue2-mlx/lyrics-example.txt \
+modelmux music src/modelmux/integrations/yue2_mlx/lyrics-example.txt \
   --profile yue2-3b-mlx-8bit \
   --set 'style=Mandarin, acoustic pop, warm clear vocals' \
   --json-events -o song.wav
@@ -79,6 +79,22 @@ and process-lifetime peak RSS. On macOS RSS is **not** a reliable total includin
 Metal allocations; do not add it to MLX peak or treat it as whole-machine usage.
 
 ## Verification and limits
+
+Normal integration tests require no weights or MLX installation:
+
+```sh
+uv run pytest src/modelmux/integrations/yue2_mlx/tests
+```
+
+After installing the local runtime and weights, explicitly enable the four-second
+model smoke test (missing models fail rather than downloading):
+
+```sh
+MODELMUX_RUN_MODEL_TESTS=1 uv run pytest src/modelmux/integrations/yue2_mlx/tests -m model
+```
+
+CLI `--set` values use YAML parsing. Quote string values such as `off`:
+`--set 'cot="off"'` (unquoted `off` is interpreted as a boolean).
 
 M4 MacBook Pro, 16 GB unified memory, MLX 0.32.2, 8-bit, 32 NAR steps,
 128-frame VAE tiles, example lyrics:

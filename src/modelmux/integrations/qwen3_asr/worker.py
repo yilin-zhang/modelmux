@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
-if __package__:
-    from modelmux.workers import protocol
-else:  # Launched by an isolated runtime as a bare script path.
-    import protocol
+if not __package__:  # Bare script in an isolated environment without modelmux installed.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from modelmux.workers import protocol
 
 
 def parser() -> argparse.ArgumentParser:

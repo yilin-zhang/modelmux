@@ -4,6 +4,7 @@ import pytest
 
 from modelmux.config import (
     ProfileStore,
+    Profile,
     apply_overrides,
     deep_merge,
     parse_override,
@@ -97,6 +98,35 @@ def test_overrides_reject_malformed_input() -> None:
 
 
 def test_profile_media_type_prefers_the_declared_value() -> None:
-    store = ProfileStore()
-    assert store.get("qwen3-tts-0.6b-base-8bit").media_type == "audio/wav"
-    assert store.get("copy").media_type == "text/plain"
+    profile = Profile("test", "test", {"output": {"extension": ".txt", "media_type": "audio/wav"}})
+    assert profile.media_type == "audio/wav"
+    assert Profile("test", "test", {"output": {"extension": ".txt"}}).media_type == "text/plain"
+
+
+@pytest.fixture
+def bundled_resources(tmp_path, monkeypatch):
+    root = tmp_path / "package"
+    (root / "profiles").mkdir(parents=True)
+    (root / "integrations" / "example").mkdir(parents=True)
+    (root / "integrations" / "experimental").mkdir()
+    (root / "integrations" / "example" / "__init__.py").write_text(
+        "raise RuntimeError('Discovery must not import model code')\n"
+    )
+    monkeypatch.setattr("modelmux.config.resources.files", lambda _package: root)
+    return root
+
+
+def test_builtins_discover_profiles_without_loading_integrations(bundled_resources, tmp_path):
+    (bundled_resources / "profiles" / "copy.yaml").write_text("name: core\ntask: copy\nadapter: copy\n")
+    (bundled_resources / "integrations" / "example" / "profile.yaml").write_text(
+        "name: example\ntask: example\nadapter: command\n"
+    )
+    assert [p.name for p in ProfileStore(tmp_path / "user").all()] == ["core", "example"]
+
+
+def test_duplicate_builtin_names_are_rejected(bundled_resources, tmp_path):
+    definition = "name: duplicate\ntask: copy\nadapter: copy\n"
+    (bundled_resources / "profiles" / "copy.yaml").write_text(definition)
+    (bundled_resources / "integrations" / "example" / "profile.yaml").write_text(definition)
+    with pytest.raises(ModelMuxError, match="Duplicate"):
+        ProfileStore(tmp_path / "user").all()
